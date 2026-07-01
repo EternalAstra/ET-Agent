@@ -1,121 +1,78 @@
 """
 ET-Agent Memory Manager — Agent-aware KV Cache memory management.
 
-Based on vLLM's PagedAttention (SOSP 2023) and MoonCake's KVCache-centric
-architecture (FAST 2025).  Provides:
+Based on vLLM's PagedAttention (SOSP 2023), MoonCake's KVCache-centric
+architecture (FAST 2025), and ACON context compression (ICML 2026).
 
 Phase 1 — Block management
-    Fixed-size page-based KV Cache allocation, logical→physical block
-    translation with copy-on-write sharing, and thread-safe block pool.
-
 Phase 2 — Prefix caching
-    MoonCake-style hash-chain prefix matching, agent-aware caching
-    strategies (system prompts, tool schemas, session history), and
-    eviction policies (LRU/LFU/AgentAware).
-
 Phase 3 — Hierarchical storage
-    GPU→CPU→SSD tiered KV Cache with lifecycle-aware migration based
-    on agent phase (prefill/decoding/tool_call/idle/completed).
-
-Components
-----------
-``KVBlockAllocator``       — fixed-size physical block pool with ref-counting
-``BlockTableManager``      — per-request logical→physical mapping + COW
-``PrefixHashCache``        — MoonCake hash-chain prefix matching
-``AgentPrefixCache``       — agent lifecycle-aware cache strategies
-``EvictionPolicy``         — LRU / LFU / AgentAware eviction policies
-``HierarchicalKVStore``    — GPU→CPU→SSD tiered storage with migration
-``LifecycleAwareKVManager``— phase-driven migration scheduling
+Phase 4 — Context compression (ACON-style)
 """
 
-# ── Phase 1: Block management ──
+# ── Phase 1 ──
 from memory_manager.kv_block import (
-    KVBlock,
-    KVBlockState,
-    BlockTableEntry,
-    StorageTier,
+    KVBlock, KVBlockState, BlockTableEntry, StorageTier,
 )
-from memory_manager.block_table import (
-    BlockTable,
-    BlockTableManager,
-)
+from memory_manager.block_table import BlockTable, BlockTableManager
 from memory_manager.kv_block_allocator import (
-    KVBlockAllocator,
-    OutOfMemoryError,
-    BlockNotFoundError,
+    KVBlockAllocator, OutOfMemoryError, BlockNotFoundError,
 )
 from memory_manager.config import MemoryConfig, ModelKVProfile, KNOWN_PROFILES
 
-# ── Phase 2: Prefix caching ──
+# ── Phase 2 ──
 from memory_manager.kv_eviction_policy import (
-    EvictionPolicy,
-    LRUEvictionPolicy,
-    LFUEvictionPolicy,
-    TieredLRUPolicy,
-    AgentAwarePolicy,
-    make_policy,
+    EvictionPolicy, LRUEvictionPolicy, LFUEvictionPolicy,
+    TieredLRUPolicy, AgentAwarePolicy, make_policy,
 )
 from memory_manager.kv_prefix_cache import (
-    PrefixHashCache,
-    PrefixCacheEntry,
-    compute_prefix_hashes,
-    compute_block_hash,
+    PrefixHashCache, PrefixCacheEntry,
+    compute_prefix_hashes, compute_block_hash,
 )
 from memory_manager.agent_prefix_cache import (
-    AgentPrefixCache,
-    estimate_agent_savings,
+    AgentPrefixCache, estimate_agent_savings,
 )
 
-# ── Phase 3: Hierarchical storage ──
+# ── Phase 3 ──
 from memory_manager.kv_lifecycle_tracker import (
-    AgentPhase,
-    RequestLifecycle,
-    LifecycleAwareKVManager,
-    LifecycleTiming,
-    phase_requires_gpu,
-    phase_latency_sensitive,
+    AgentPhase, RequestLifecycle, LifecycleAwareKVManager,
+    LifecycleTiming, phase_requires_gpu, phase_latency_sensitive,
 )
 from memory_manager.kv_hierarchical_store import (
-    HierarchicalKVStore,
-    MigrationTask,
+    HierarchicalKVStore, MigrationTask,
+)
+
+# ── Phase 4: Context compression (ACON, ICML 2026) ──
+from memory_manager.context_compressor import (
+    ContextCompressor, CompressionMode, CompressionThresholds,
+    CompressionResult,
+)
+from memory_manager.prompt_deduplicator import (
+    PromptDeduplicator, hash_content, DedupResult,
+)
+from memory_manager.tool_schema_compressor import (
+    ToolSchemaCompressor, CompressionTier,
 )
 
 __all__ = [
-    # ── Block management ──
-    "KVBlockAllocator",
-    "BlockTableManager",
-    "BlockTable",
-    "KVBlock",
-    "KVBlockState",
-    "BlockTableEntry",
-    "StorageTier",
-    "MemoryConfig",
-    "ModelKVProfile",
-    "KNOWN_PROFILES",
-    "OutOfMemoryError",
-    "BlockNotFoundError",
-    # ── Prefix caching ──
-    "PrefixHashCache",
-    "PrefixCacheEntry",
-    "AgentPrefixCache",
-    "compute_prefix_hashes",
-    "compute_block_hash",
-    # ── Eviction ──
-    "EvictionPolicy",
-    "LRUEvictionPolicy",
-    "LFUEvictionPolicy",
-    "TieredLRUPolicy",
-    "AgentAwarePolicy",
-    "make_policy",
-    # ── Hierarchical storage ──
-    "HierarchicalKVStore",
-    "MigrationTask",
-    "AgentPhase",
-    "RequestLifecycle",
-    "LifecycleAwareKVManager",
-    "LifecycleTiming",
-    "phase_requires_gpu",
-    "phase_latency_sensitive",
-    # ── Utilities ──
+    # Phase 1
+    "KVBlockAllocator", "BlockTableManager", "BlockTable",
+    "KVBlock", "KVBlockState", "BlockTableEntry", "StorageTier",
+    "MemoryConfig", "ModelKVProfile", "KNOWN_PROFILES",
+    "OutOfMemoryError", "BlockNotFoundError",
+    # Phase 2
+    "PrefixHashCache", "PrefixCacheEntry", "AgentPrefixCache",
+    "compute_prefix_hashes", "compute_block_hash",
+    "EvictionPolicy", "LRUEvictionPolicy", "LFUEvictionPolicy",
+    "TieredLRUPolicy", "AgentAwarePolicy", "make_policy",
+    # Phase 3
+    "HierarchicalKVStore", "MigrationTask",
+    "AgentPhase", "RequestLifecycle", "LifecycleAwareKVManager",
+    "LifecycleTiming", "phase_requires_gpu", "phase_latency_sensitive",
     "estimate_agent_savings",
+    # Phase 4
+    "ContextCompressor", "CompressionMode", "CompressionThresholds",
+    "CompressionResult",
+    "PromptDeduplicator", "hash_content", "DedupResult",
+    "ToolSchemaCompressor", "CompressionTier",
 ]
