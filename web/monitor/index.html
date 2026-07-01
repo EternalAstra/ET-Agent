@@ -1,0 +1,488 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-mode="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ET-Agent Memory Monitor</title>
+<style>
+/* ═══════════ Design Tokens (EternFlow-inspired) ═══════════ */
+:root {
+  --primary: #10a37f; --primary-hover: #0d8c6d; --primary-alpha: rgba(16,163,127,0.15);
+  --bg-primary: #1a1a2e; --bg-secondary: #16213e; --bg-card: #1e2a4a;
+  --bg-code: #0f1923;
+  --text-primary: #e8eaed; --text-secondary: #9aa0a6; --text-tertiary: #6b7280;
+  --border-color: #2d3748;
+  --chart-gpu: #10a37f; --chart-cpu: #f59e0b; --chart-ssd: #6366f1;
+  --chart-hit: #22c55e; --chart-miss: #ef4444; --chart-migrate: #8b5cf6;
+  --shadow-sm: 0 1px 3px rgba(0,0,0,0.3); --shadow-md: 0 4px 12px rgba(0,0,0,0.4);
+  --radius: 10px;
+}
+[data-mode="light"] { --bg-primary:#f8fafc;--bg-secondary:#fff;--bg-card:#fff; --text-primary:#1e293b;--text-secondary:#64748b;--text-tertiary:#94a3b8; --border-color:#e2e8f0; --shadow-sm:0 1px 3px rgba(0,0,0,0.08); --shadow-md:0 4px 12px rgba(0,0,0,0.12); }
+
+* { margin:0; padding:0; box-sizing:border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; background: var(--bg-primary); color: var(--text-primary); min-height: 100vh; }
+a { color: var(--primary); text-decoration: none; }
+
+/* Layout */
+.app { display: flex; min-height: 100vh; }
+.sidebar { width: 220px; background: var(--bg-secondary); border-right: 1px solid var(--border-color); padding: 20px 0; flex-shrink: 0; }
+.sidebar-logo { padding: 0 20px 20px; font-size: 18px; font-weight: 700; color: var(--primary); border-bottom: 1px solid var(--border-color); margin-bottom: 20px; }
+.sidebar-nav a { display: block; padding: 10px 20px; color: var(--text-secondary); font-size: 14px; transition: all 0.15s; }
+.sidebar-nav a:hover, .sidebar-nav a.active { color: var(--primary); background: var(--primary-alpha); }
+.main { flex: 1; padding: 30px; overflow-y: auto; }
+
+/* Cards row */
+.stats-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 24px; }
+.stat-card { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: var(--radius); padding: 20px; transition: transform 0.2s, box-shadow 0.2s; }
+.stat-card:hover { transform: translateY(-2px); box-shadow: var(--shadow-md); }
+.stat-card .icon { width: 40px; height: 40px; border-radius: 10px; display: flex; align-items: center; justify-content: center; font-size: 20px; margin-bottom: 12px; }
+.stat-card .value { font-size: 28px; font-weight: 700; margin-bottom: 4px; }
+.stat-card .label { font-size: 13px; color: var(--text-secondary); }
+.icon-gpu { background: rgba(16,163,127,0.15); color: var(--chart-gpu); }
+.icon-cpu { background: rgba(245,158,11,0.15); color: var(--chart-cpu); }
+.icon-cache { background: rgba(34,197,94,0.15); color: var(--chart-hit); }
+.icon-compress { background: rgba(99,102,241,0.15); color: var(--chart-ssd); }
+
+/* Chart section */
+.section { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: var(--radius); padding: 24px; margin-bottom: 24px; }
+.section h3 { font-size: 16px; margin-bottom: 16px; color: var(--text-primary); }
+.section h3 .badge { font-size: 11px; padding: 2px 8px; border-radius: 10px; margin-left: 8px; }
+.badge-gpu { background: rgba(16,163,127,0.15); color: var(--chart-gpu); }
+.badge-cpu { background: rgba(245,158,11,0.15); color: var(--chart-cpu); }
+.badge-ssd { background: rgba(99,102,241,0.15); color: var(--chart-ssd); }
+
+/* Bar chart (EternFlow-style pure CSS) */
+.chart-bars { display: flex; flex-direction: column; gap: 10px; }
+.chart-bar-row { display: flex; align-items: center; gap: 12px; }
+.chart-bar-label { width: 120px; font-size: 13px; color: var(--text-secondary); text-align: right; flex-shrink: 0; }
+.chart-bar-track { flex: 1; height: 24px; background: var(--bg-code); border-radius: 6px; overflow: hidden; position: relative; }
+.chart-bar-fill { height: 100%; border-radius: 6px; transition: width 0.6s ease; }
+.chart-bar-fill.gpu { background: var(--chart-gpu); }
+.chart-bar-fill.cpu { background: var(--chart-cpu); }
+.chart-bar-fill.ssd { background: var(--chart-ssd); }
+.chart-bar-value { width: 100px; font-size: 12px; color: var(--text-secondary); flex-shrink: 0; }
+
+/* Line chart (pure CSS SVG) */
+.line-chart { width: 100%; height: 200px; }
+.line-chart svg { width: 100%; height: 100%; }
+
+/* Dual bars row */
+.chart-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+.chart-grid-full { grid-template-columns: 1fr; }
+
+/* Phase distribution */
+.phase-bars { display: flex; gap: 12px; flex-wrap: wrap; }
+.phase-bar { flex: 1; min-width: 100px; text-align: center; }
+.phase-bar .fill { height: 80px; border-radius: 8px 8px 0 0; transition: height 0.5s ease; margin-bottom: 8px; display: flex; align-items: flex-end; justify-content: center; color: #fff; font-weight: 700; font-size: 18px; }
+.phase-bar .ph-label { font-size: 11px; color: var(--text-secondary); }
+
+/* Summary table */
+.summary-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.summary-table th { text-align: left; padding: 8px 12px; border-bottom: 2px solid var(--border-color); color: var(--text-secondary); font-weight: 600; }
+.summary-table td { padding: 8px 12px; border-bottom: 1px solid var(--border-color); }
+.summary-table tr:last-child td { border-bottom: none; }
+.summary-table .highlight { color: var(--primary); font-weight: 600; }
+
+/* Theme toggle */
+.theme-toggle { position: fixed; top: 16px; right: 16px; width: 36px; height: 36px; border-radius: 50%; border: 1px solid var(--border-color); background: var(--bg-card); color: var(--text-secondary); cursor: pointer; font-size: 16px; z-index: 100; }
+.theme-toggle:hover { background: var(--bg-secondary); }
+
+/* Loading */
+.loading { text-align: center; padding: 60px 0; color: var(--text-tertiary); }
+.loading .spinner { width: 32px; height: 32px; border: 3px solid var(--border-color); border-top-color: var(--primary); border-radius: 50%; animation: spin 0.8s linear infinite; margin: 0 auto 12px; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* Feature grid */
+.feature-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; }
+.feature-card { background: var(--bg-code); border-radius: 8px; padding: 16px; }
+.feature-card h4 { font-size: 14px; margin-bottom: 8px; }
+.feature-card p { font-size: 12px; color: var(--text-secondary); line-height: 1.5; }
+</style>
+</head>
+<body>
+<button class="theme-toggle" onclick="toggleTheme()" title="Toggle theme">☀</button>
+
+<div class="app">
+  <aside class="sidebar">
+    <div class="sidebar-logo">⚡ ET-Agent</div>
+    <nav class="sidebar-nav">
+      <a href="#overview" class="active" onclick="showTab('overview')">📊 Overview</a>
+      <a href="#tiers" onclick="showTab('tiers')">📦 Storage Tiers</a>
+      <a href="#cache" onclick="showTab('cache')">🎯 Prefix Cache</a>
+      <a href="#lifecycle" onclick="showTab('lifecycle')">🔄 Lifecycle</a>
+      <a href="#compression" onclick="showTab('compression')">📐 Compression</a>
+      <a href="#features" onclick="showTab('features')">⭐ vs Hermes</a>
+    </nav>
+  </aside>
+
+  <main class="main" id="main-content">
+    <div class="loading" id="loading">
+      <div class="spinner"></div>
+      <p>Loading benchmark data...</p>
+      <p style="font-size:12px;margin-top:8px">Run <code>python scripts/benchmark_memory.py</code> first</p>
+    </div>
+    <div id="dashboard" style="display:none"></div>
+  </main>
+</div>
+
+<script>
+// ═══════════ Theme toggle ═══════════
+function toggleTheme() {
+  const html = document.documentElement;
+  const current = html.getAttribute('data-mode');
+  const next = current === 'dark' ? 'light' : 'dark';
+  html.setAttribute('data-mode', next);
+  document.querySelector('.theme-toggle').textContent = next === 'dark' ? '☀' : '🌙';
+}
+
+// ═══════════ Tab switching ═══════════
+function showTab(name) {
+  document.querySelectorAll('.sidebar-nav a').forEach(a => a.classList.remove('active'));
+  document.querySelector(`.sidebar-nav a[href="#${name}"]`).classList.add('active');
+  document.querySelectorAll('.tab-content').forEach(el => el.style.display = 'none');
+  const el = document.getElementById('tab-' + name);
+  if (el) el.style.display = 'block';
+}
+
+// ═══════════ Data loading ═══════════
+let DATA = null;
+
+function loadData() {
+  // Try embedded data first, then fetch
+  if (window.BENCHMARK_DATA) {
+    DATA = window.BENCHMARK_DATA;
+    renderDashboard();
+    return;
+  }
+  fetch('benchmark_data.js')
+    .then(r => r.text())
+    .then(t => {
+      const match = t.match(/window\.BENCHMARK_DATA\s*=\s*([\s\S]*?);\s*$/);
+      if (match) DATA = JSON.parse(match[1]);
+      renderDashboard();
+    })
+    .catch(() => {
+      renderEmptyState();
+    });
+}
+
+function renderEmptyState() {
+  document.getElementById('loading').innerHTML = `
+    <div style="text-align:center;padding:60px 0">
+      <div style="font-size:48px;margin-bottom:16px">📊</div>
+      <h3>No benchmark data yet</h3>
+      <p style="color:var(--text-secondary);margin:8px 0">Run the benchmark to generate data:</p>
+      <code style="background:var(--bg-code);padding:8px 16px;border-radius:6px;display:inline-block;margin-top:8px">
+        python scripts/benchmark_memory.py
+      </code>
+    </div>`;
+}
+
+// ═══════════ Render helpers ═══════════
+function formatBytes(b) {
+  if (!b || b === 0) return '0 B';
+  const units = ['B','KB','MB','GB','TB'];
+  const i = Math.floor(Math.log(b) / Math.log(1024));
+  return (b / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0) + ' ' + units[i];
+}
+
+function pct(v) { return (v * 100).toFixed(1) + '%'; }
+
+// ═══════════ Bar chart ═══════════
+function renderBars(containerId, items, maxVal) {
+  const container = document.getElementById(containerId);
+  if (!container) return;
+  const max = maxVal || Math.max(...items.map(i => i.value), 1);
+  container.innerHTML = items.map(item => `
+    <div class="chart-bar-row">
+      <span class="chart-bar-label">${item.label}</span>
+      <div class="chart-bar-track">
+        <div class="chart-bar-fill ${item.css || ''}" style="width:${(item.value/max)*100}%"></div>
+      </div>
+      <span class="chart-bar-value">${item.display || item.value}</span>
+    </div>
+  `).join('');
+}
+
+// ═══════════ Line chart (SVG) ═══════════
+function renderLineChart(containerId, series, color, maxY) {
+  const container = document.getElementById(containerId);
+  if (!container || !series || series.length < 2) return;
+
+  const W = container.clientWidth || 600, H = 200, pad = 20;
+  const max = maxY || Math.max(...series, 1);
+  const stepX = (W - pad * 2) / (series.length - 1);
+
+  let points = series.map((v, i) => {
+    const x = pad + i * stepX;
+    const y = H - pad - (v / max) * (H - pad * 2);
+    return `${x},${y}`;
+  }).join(' ');
+
+  container.innerHTML = `
+    <svg viewBox="0 0 ${W} ${H}" style="width:100%;height:${H}px">
+      <polyline points="${points}" fill="none" stroke="${color}" stroke-width="2" vector-effect="non-scaling-stroke"/>
+      <g fill="${color}" opacity="0.15">
+        <polygon points="${pad},${H-pad} ${points} ${W-pad},${H-pad}" />
+      </g>
+    </svg>`;
+}
+
+// ═══════════ Dashboard render ═══════════
+function renderDashboard() {
+  document.getElementById('loading').style.display = 'none';
+  document.getElementById('dashboard').style.display = 'block';
+
+  if (!DATA || !DATA.scenarios) { renderEmptyState(); return; }
+
+  const keys = Object.keys(DATA.scenarios);
+  const sc = DATA.scenarios[keys[0]];
+  const charts = sc.charts;
+  const summary = charts.summary;
+  const snaps = sc.snapshots;
+  const last = snaps[snaps.length - 1];
+
+  const statsHTML = `
+    <div class="stats-row">
+      <div class="stat-card">
+        <div class="icon icon-gpu">📦</div>
+        <div class="value">${summary.peak_gpu_blocks || 0}</div>
+        <div class="label">Peak GPU Blocks</div>
+      </div>
+      <div class="stat-card">
+        <div class="icon icon-cpu">💾</div>
+        <div class="value">${last ? last.tiers.cpu_blocks : 0}</div>
+        <div class="label">CPU Blocks</div>
+      </div>
+      <div class="stat-card">
+        <div class="icon icon-cache">🎯</div>
+        <div class="value">${pct(summary.avg_prefix_hit_rate || 0)}</div>
+        <div class="label">Avg Prefix Hit Rate</div>
+      </div>
+      <div class="stat-card">
+        <div class="icon icon-compress">📐</div>
+        <div class="value">${(summary.total_tokens_saved || 0).toLocaleString()}</div>
+        <div class="label">Tokens Saved</div>
+      </div>
+    </div>
+  `;
+
+  let content = statsHTML;
+
+  // Overview tab
+  content += `
+  <div class="tab-content" id="tab-overview">
+    <div class="section">
+      <h3>📊 Block Allocation by Tier</h3>
+      <div id="bar-tier-breakdown" class="chart-bars"></div>
+    </div>
+    <div class="chart-grid">
+      <div class="section">
+        <h3>📈 GPU Block Usage Over Time</h3>
+        <div id="line-gpu-blocks" class="line-chart"></div>
+      </div>
+      <div class="section">
+        <h3>🎯 Prefix Cache Hit Rate</h3>
+        <div id="line-prefix-hit" class="line-chart"></div>
+      </div>
+    </div>
+  </div>
+  `;
+
+  // Tiers tab
+  content += `
+  <div class="tab-content" id="tab-tiers" style="display:none">
+    <div class="section">
+      <h3>📦 Storage Tier Distribution</h3>
+      <div id="bar-tier-bytes" class="chart-bars"></div>
+    </div>
+    <div class="chart-grid">
+      <div class="section">
+        <h3>📈 Tier Usage Ratio</h3>
+        <div id="line-tier-ratios" class="line-chart"></div>
+      </div>
+      <div class="section">
+        <h3>🔄 Migration Activity</h3>
+        <div id="line-migrations" class="line-chart"></div>
+      </div>
+    </div>
+  </div>`;
+
+  // Cache tab
+  content += `
+  <div class="tab-content" id="tab-cache" style="display:none">
+    <div class="section">
+      <h3>🎯 Prefix Cache Performance</h3>
+      <div id="bar-cache-stats" class="chart-bars"></div>
+    </div>
+    <div class="section">
+      <h3>📈 Blocks Reused via Prefix Cache</h3>
+      <div id="line-blocks-reused" class="line-chart"></div>
+    </div>
+  </div>`;
+
+  // Lifecycle tab
+  content += `
+  <div class="tab-content" id="tab-lifecycle" style="display:none">
+    <div class="section">
+      <h3>🔄 Agent Phase Distribution</h3>
+      <div id="phase-distribution" class="phase-bars"></div>
+    </div>
+    <div class="chart-grid">
+      <div class="section">
+        <h3>📈 Active vs Waiting Sessions</h3>
+        <div id="line-active-waiting" class="line-chart"></div>
+      </div>
+      <div class="section">
+        <h3>📊 Lifecycle Transitions</h3>
+        <div id="bar-transitions" class="chart-bars"></div>
+      </div>
+    </div>
+  </div>`;
+
+  // Compression tab
+  content += `
+  <div class="tab-content" id="tab-compression" style="display:none">
+    <div class="section">
+      <h3>📐 Token Savings Breakdown</h3>
+      <div id="bar-compression" class="chart-bars"></div>
+    </div>
+    <div class="section">
+      <h3>📈 Cumulative Tokens Saved</h3>
+      <div id="line-tokens-saved" class="line-chart"></div>
+    </div>
+  </div>`;
+
+  // Features tab
+  content += `
+  <div class="tab-content" id="tab-features" style="display:none">
+    <div class="section">
+      <h3>⭐ ET-Agent vs Original Hermes</h3>
+      <div class="feature-grid">
+        <div class="feature-card">
+          <h4>📦 Paged KV Cache <span class="badge badge-gpu">NEW</span></h4>
+          <p>vLLM-style paged block allocation eliminates ~60% memory waste from contiguous allocation. Fixed-size blocks with ref-counting and COW sharing.</p>
+        </div>
+        <div class="feature-card">
+          <h4>🎯 Prefix Hash Cache <span class="badge badge-gpu">NEW</span></h4>
+          <p>MoonCake-style hash-chain matching reuses KV Cache across turns. System prompts and tool schemas are pinned (never evicted).</p>
+        </div>
+        <div class="feature-card">
+          <h4>📦 Hierarchical Storage <span class="badge badge-cpu">NEW</span></h4>
+          <p>GPU→CPU→SSD three-tier storage with lifecycle-driven migration. Tool-call idle blocks auto-demote after 30s, prefetch on resume.</p>
+        </div>
+        <div class="feature-card">
+          <h4>🔄 Lifecycle Tracker <span class="badge badge-ssd">NEW</span></h4>
+          <p>5-phase agent lifecycle (PREFILL/DECODING/TOOL_CALL/IDLE/COMPLETED) with phase-aware memory policies and session protection.</p>
+        </div>
+        <div class="feature-card">
+          <h4>📐 ACON Compression <span class="badge badge-ssd">NEW</span></h4>
+          <p>Structured context compression with REASONING/VARS/ACTIONS/OPEN_TASKS sections. 26-54% token reduction (ICML 2026).</p>
+        </div>
+        <div class="feature-card">
+          <h4>🔧 Tool Schema Compressor <span class="badge badge-gpu">NEW</span></h4>
+          <p>Frequency-based progressive disclosure: high-freq tools keep full schemas, low-freq tools reduce to name-only (30 tokens).</p>
+        </div>
+        <div class="feature-card">
+          <h4>🗑️ Project Trimmed <span class="badge badge-cpu">MODIFIED</span></h4>
+          <p>Removed 25+ platform gateways, TUI, Web UI, Desktop, Cron scheduler. From 5,401 files (123MB) to ~3,000 files (60MB).</p>
+        </div>
+        <div class="feature-card">
+          <h4>🏷️ Renamed to ET-Agent <span class="badge badge-cpu">MODIFIED</span></h4>
+          <p>Full rebrand: Hermes Agent v0.17.0 → ET-Agent v0.0.1. All env vars (HERMES_HOME→ET_AGENT_HOME), paths, and branding updated.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="section">
+      <h3>📊 Architecture Comparison</h3>
+      <table class="summary-table">
+        <tr><th>Feature</th><th>Original Hermes</th><th>ET-Agent</th></tr>
+        <tr><td>KV Cache Management</td><td>Contiguous allocation (~60% waste)</td><td class="highlight">PagedAttention (~3.7% waste)</td></tr>
+        <tr><td>Prefix Reuse</td><td>Not implemented</td><td class="highlight">MoonCake hash-chain prefix cache</td></tr>
+        <tr><td>Storage Tiers</td><td>GPU only</td><td class="highlight">GPU→CPU→SSD hierarchical</td></tr>
+        <tr><td>Lifecycle Awareness</td><td>Stateless</td><td class="highlight">5-phase agent lifecycle tracker</td></tr>
+        <tr><td>Context Compression</td><td>Generic context_engine</td><td class="highlight">ACON structured compression</td></tr>
+        <tr><td>Tool Definitions</td><td>Full schema every turn</td><td class="highlight">Frequency-tiered, progressive disclosure</td></tr>
+        <tr><td>Prompt Dedup</td><td>Not implemented</td><td class="highlight">System prompt + tool elision after first turn</td></tr>
+        <tr><td>Codebase Size</td><td>5,401 files, 123MB</td><td class="highlight">~3,000 files, 60MB (45% smaller)</td></tr>
+        <tr><td>Test Coverage</td><td>~200+ tests</td><td class="highlight">273 dedicated memory tests</td></tr>
+      </table>
+    </div>
+  </div>`;
+
+  document.getElementById('dashboard').innerHTML = content;
+
+  // ── Populate charts ──
+  setTimeout(() => {
+    // Overview
+    if (last) {
+      renderBars('bar-tier-breakdown', [
+        {label: 'GPU Blocks', value: last.blocks.gpu_blocks, css: 'gpu', display: String(last.blocks.gpu_blocks)},
+        {label: 'CPU Blocks', value: last.blocks.cpu_blocks, css: 'cpu', display: String(last.blocks.cpu_blocks)},
+        {label: 'SSD Blocks', value: last.blocks.ssd_blocks, css: 'ssd', display: String(last.blocks.ssd_blocks)},
+      ]);
+      renderBars('bar-tier-bytes', [
+        {label: 'GPU', value: last.tiers.gpu_bytes, css: 'gpu', display: formatBytes(last.tiers.gpu_bytes)},
+        {label: 'CPU', value: last.tiers.cpu_bytes, css: 'cpu', display: formatBytes(last.tiers.cpu_bytes)},
+        {label: 'SSD', value: last.tiers.ssd_bytes, css: 'ssd', display: formatBytes(last.tiers.ssd_bytes)},
+      ]);
+      renderBars('bar-cache-stats', [
+        {label: 'Cache Entries', value: last.prefix.total_entries, display: String(last.prefix.total_entries)},
+        {label: 'Pinned', value: last.prefix.pinned_entries, css: 'gpu', display: String(last.prefix.pinned_entries)},
+        {label: 'Hot Blocks', value: last.prefix.hot_entries, css: 'cpu', display: String(last.prefix.hot_entries)},
+        {label: 'Hit Rate', value: Math.round(last.prefix.hit_rate * 1000), css: 'ssd', display: pct(last.prefix.hit_rate)},
+      ]);
+      renderBars('bar-transitions', [
+        {label: 'Demotions', value: last.lifecycle.total_demotions || 0, css: 'cpu'},
+        {label: 'Promotions', value: last.lifecycle.total_promotions || 0, css: 'gpu'},
+        {label: 'Evictions', value: last.lifecycle.total_evictions || 0, css: 'ssd'},
+      ]);
+      renderBars('bar-compression', [
+        {label: 'History Compr', value: last.compression.history_compressions || 1, display: String(last.compression.history_compressions || 0)},
+        {label: 'Obs Compr', value: last.compression.observation_compressions || 1, display: String(last.compression.observation_compressions || 0)},
+        {label: 'Tokens Saved', value: Math.max(last.compression.total_tokens_saved || 1, 1), css: 'gpu', display: (last.compression.total_tokens_saved || 0).toLocaleString()},
+        {label: 'Msg Dropped', value: Math.max(last.compression.total_messages_dropped || 1, 1), css: 'cpu', display: String(last.compression.total_messages_dropped || 0)},
+        {label: 'Tools Tracked', value: Math.max(last.compression.tools_tracked || 1, 1), css: 'ssd', display: String(last.compression.tools_tracked || 0)},
+      ]);
+    }
+
+    // Phase distribution
+    if (last && last.lifecycle) {
+      const lc = last.lifecycle;
+      const phases = [
+        {label:'Prefill', value:lc.prefill_count, color:'#10a37f'},
+        {label:'Decoding', value:lc.decoding_count, color:'#22c55e'},
+        {label:'ToolCall', value:lc.tool_call_count, color:'#f59e0b'},
+        {label:'Idle', value:lc.idle_count, color:'#6366f1'},
+        {label:'Completed', value:lc.completed_count, color:'#6b7280'},
+      ];
+      const maxPh = Math.max(...phases.map(p => p.value), 1);
+      document.getElementById('phase-distribution').innerHTML = phases.map(p => `
+        <div class="phase-bar">
+          <div class="fill" style="height:${(p.value/maxPh)*100}%;background:${p.color}">${p.value}</div>
+          <div class="ph-label">${p.label}</div>
+        </div>
+      `).join('');
+    }
+
+    // Line charts
+    if (charts) {
+      renderLineChart('line-gpu-blocks', charts.series.gpu_blocks_used, '#10a37f');
+      renderLineChart('line-prefix-hit', charts.series.prefix_hit_rate.map(v => v*100), '#22c55e', 100);
+      renderLineChart('line-tier-ratios', charts.series.gpu_usage_ratio.map(v => v*100), '#10a37f', 100);
+      renderLineChart('line-migrations', charts.series.total_migrations, '#8b5cf6');
+      renderLineChart('line-active-waiting', charts.series.active_requests, '#10a37f');
+      renderLineChart('line-tokens-saved', charts.series.tokens_saved, '#6366f1');
+    }
+  }, 100);
+}
+
+// ═══════════ Initialize ═══════════
+window.addEventListener('DOMContentLoaded', loadData);
+window.addEventListener('resize', () => { if (DATA) renderDashboard(); });
+</script>
+
+<script src="benchmark_data.js"></script>
+</body>
+</html>
