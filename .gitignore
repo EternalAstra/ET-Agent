@@ -43,3 +43,7 @@ result-*/
 
 # Node
 node_modules/
+
+# Generated
+*.docx
+web/monitor/benchmark_data.js
