@@ -1,0 +1,1 @@
+"""Stub: Gateway platforms removed."""
