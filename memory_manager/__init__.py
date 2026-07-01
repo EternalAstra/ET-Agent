@@ -13,8 +13,9 @@ Phase 2 — Prefix caching
     strategies (system prompts, tool schemas, session history), and
     eviction policies (LRU/LFU/AgentAware).
 
-Phase 3 — Hierarchical storage  (coming)
-    GPU→CPU→SSD tiered KV Cache with lifecycle-aware migration.
+Phase 3 — Hierarchical storage
+    GPU→CPU→SSD tiered KV Cache with lifecycle-aware migration based
+    on agent phase (prefill/decoding/tool_call/idle/completed).
 
 Components
 ----------
@@ -23,6 +24,8 @@ Components
 ``PrefixHashCache``        — MoonCake hash-chain prefix matching
 ``AgentPrefixCache``       — agent lifecycle-aware cache strategies
 ``EvictionPolicy``         — LRU / LFU / AgentAware eviction policies
+``HierarchicalKVStore``    — GPU→CPU→SSD tiered storage with migration
+``LifecycleAwareKVManager``— phase-driven migration scheduling
 """
 
 # ── Phase 1: Block management ──
@@ -63,6 +66,20 @@ from memory_manager.agent_prefix_cache import (
     estimate_agent_savings,
 )
 
+# ── Phase 3: Hierarchical storage ──
+from memory_manager.kv_lifecycle_tracker import (
+    AgentPhase,
+    RequestLifecycle,
+    LifecycleAwareKVManager,
+    LifecycleTiming,
+    phase_requires_gpu,
+    phase_latency_sensitive,
+)
+from memory_manager.kv_hierarchical_store import (
+    HierarchicalKVStore,
+    MigrationTask,
+)
+
 __all__ = [
     # ── Block management ──
     "KVBlockAllocator",
@@ -90,6 +107,15 @@ __all__ = [
     "TieredLRUPolicy",
     "AgentAwarePolicy",
     "make_policy",
+    # ── Hierarchical storage ──
+    "HierarchicalKVStore",
+    "MigrationTask",
+    "AgentPhase",
+    "RequestLifecycle",
+    "LifecycleAwareKVManager",
+    "LifecycleTiming",
+    "phase_requires_gpu",
+    "phase_latency_sensitive",
     # ── Utilities ──
     "estimate_agent_savings",
 ]
