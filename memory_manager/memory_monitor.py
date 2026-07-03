@@ -251,14 +251,13 @@ class MemoryMonitor:
         return {
             "timestamps": timestamps,
             "series": {
-                # Block usage over time
-                "gpu_blocks_used": [
-                    s.blocks.gpu_blocks - s.blocks.free
-                    for s in snapshots
-                ],
+                # GPU tier occupancy (from hierarchical store; NOT allocator free pool)
+                "gpu_blocks_used": [s.blocks.gpu_blocks for s in snapshots],
                 "cpu_blocks": [s.blocks.cpu_blocks for s in snapshots],
                 "ssd_blocks": [s.blocks.ssd_blocks for s in snapshots],
                 "shared_blocks": [s.blocks.shared for s in snapshots],
+                # Allocator-level used blocks (all tiers pooled)
+                "allocator_blocks_used": [s.blocks.used for s in snapshots],
 
                 # Prefix cache hit rate
                 "prefix_hit_rate": [s.prefix.hit_rate for s in snapshots],
@@ -279,9 +278,8 @@ class MemoryMonitor:
                 "tokens_saved": [s.compression.total_tokens_saved for s in snapshots],
             },
             "summary": {
-                "peak_gpu_blocks": max(
-                    s.blocks.gpu_blocks - s.blocks.free for s in snapshots
-                ),
+                "peak_gpu_blocks": max(s.blocks.gpu_blocks for s in snapshots),
+                "peak_allocator_used": max(s.blocks.used for s in snapshots),
                 "avg_prefix_hit_rate": sum(
                     s.prefix.hit_rate for s in snapshots
                 ) / len(snapshots),

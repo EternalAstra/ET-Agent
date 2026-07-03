@@ -1,0 +1,168 @@
+{
+  "generated_at": "2026-07-02T09:14:07.705149+00:00",
+  "model": "qwen2.5:3b-instruct",
+  "base_url": "http://127.0.0.1:11434/v1",
+  "gpu_gb": 6,
+  "ollama_num_ctx": 4096,
+  "records": [
+    {
+      "scenario": "chat",
+      "mode": "hermes",
+      "label": "Hermes baseline (KV off)",
+      "kv_enabled": false,
+      "model": "qwen2.5:3b-instruct",
+      "base_url": "http://127.0.0.1:11434/v1",
+      "gpu_gb": 6,
+      "timestamp": "2026-07-02T09:13:59.033436+00:00",
+      "elapsed_s": 11.68,
+      "api_calls": 3,
+      "total_tokens": 0,
+      "tool_calls": 0,
+      "task_ok": true,
+      "validation": {
+        "remembered_name": true,
+        "name_turn_response": "小明",
+        "task_ok": true
+      },
+      "final_response": "虚拟内存是在硬盘上分配的一块空间，用来扩展物理内存容量。",
+      "turn_results": [
+        {
+          "turn": 1,
+          "prompt": "你好，请记住我的名字是小明。只回复「好的」。",
+          "elapsed_s": 7.57,
+          "api_calls": 1,
+          "final_response": "好的",
+          "failed": false
+        },
+        {
+          "turn": 2,
+          "prompt": "我刚才说我叫什么？只回答名字。",
+          "elapsed_s": 0.45,
+          "api_calls": 1,
+          "final_response": "小明",
+          "failed": false
+        },
+        {
+          "turn": 3,
+          "prompt": "用一句话解释什么是操作系统里的虚拟内存。",
+          "elapsed_s": 0.44,
+          "api_calls": 1,
+          "final_response": "虚拟内存是在硬盘上分配的一块空间，用来扩展物理内存容量。",
+          "failed": false
+        }
+      ],
+      "kv_metrics": {},
+      "error": null
+    },
+    {
+      "scenario": "chat",
+      "mode": "et",
+      "label": "ET-Agent (KV on)",
+      "kv_enabled": true,
+      "model": "qwen2.5:3b-instruct",
+      "base_url": "http://127.0.0.1:11434/v1",
+      "gpu_gb": 6,
+      "timestamp": "2026-07-02T09:14:07.704402+00:00",
+      "elapsed_s": 8.67,
+      "api_calls": 3,
+      "total_tokens": 0,
+      "tool_calls": 0,
+      "task_ok": true,
+      "validation": {
+        "remembered_name": true,
+        "name_turn_response": "小明",
+        "task_ok": true
+      },
+      "final_response": "虚拟内存是操作系统利用硬盘空间作为内存使用，以增加内存容量。",
+      "turn_results": [
+        {
+          "turn": 1,
+          "prompt": "你好，请记住我的名字是小明。只回复「好的」。",
+          "elapsed_s": 5.69,
+          "api_calls": 1,
+          "final_response": "好的",
+          "failed": false
+        },
+        {
+          "turn": 2,
+          "prompt": "我刚才说我叫什么？只回答名字。",
+          "elapsed_s": 0.55,
+          "api_calls": 1,
+          "final_response": "小明",
+          "failed": false
+        },
+        {
+          "turn": 3,
+          "prompt": "用一句话解释什么是操作系统里的虚拟内存。",
+          "elapsed_s": 0.51,
+          "api_calls": 1,
+          "final_response": "虚拟内存是操作系统利用硬盘空间作为内存使用，以增加内存容量。",
+          "failed": false
+        }
+      ],
+      "kv_metrics": {
+        "kv_active": true,
+        "sessions": 1,
+        "turns": 3,
+        "prefix_hit_rate": 0.6667,
+        "prefix_hits": 2,
+        "migrations": 0,
+        "tokens_saved": 0,
+        "peak_gpu_blocks": 180,
+        "gpu_blocks_allocated": 180,
+        "lifecycle_requests": 1
+      },
+      "error": null
+    },
+    {
+      "scenario": "tool_chain",
+      "mode": "hermes",
+      "label": "Hermes baseline (KV off)",
+      "kv_enabled": false,
+      "skipped": true,
+      "skip_reason": "Ollama num_ctx=4096 < 64000; ET-Agent blocks tool calls below 64K runtime context. Re-run with --ollama-num-ctx 65536 (needs more VRAM).",
+      "model": "qwen2.5:3b-instruct",
+      "ollama_num_ctx": 4096,
+      "task_ok": false
+    },
+    {
+      "scenario": "tool_chain",
+      "mode": "et",
+      "label": "ET-Agent (KV on)",
+      "kv_enabled": true,
+      "skipped": true,
+      "skip_reason": "Ollama num_ctx=4096 < 64000; ET-Agent blocks tool calls below 64K runtime context. Re-run with --ollama-num-ctx 65536 (needs more VRAM).",
+      "model": "qwen2.5:3b-instruct",
+      "ollama_num_ctx": 4096,
+      "task_ok": false
+    }
+  ],
+  "comparisons": [
+    {
+      "scenario": "chat",
+      "hermes_elapsed_s": 11.68,
+      "et_elapsed_s": 8.67,
+      "elapsed_delta_s": -3.01,
+      "hermes_api_calls": 3,
+      "et_api_calls": 3,
+      "hermes_task_ok": true,
+      "et_task_ok": true,
+      "prefix_hit_rate": 0.6667,
+      "migrations": 0,
+      "tokens_saved": 0
+    },
+    {
+      "scenario": "tool_chain",
+      "hermes_elapsed_s": null,
+      "et_elapsed_s": null,
+      "elapsed_delta_s": 0,
+      "hermes_api_calls": null,
+      "et_api_calls": null,
+      "hermes_task_ok": false,
+      "et_task_ok": false,
+      "prefix_hit_rate": null,
+      "migrations": null,
+      "tokens_saved": null
+    }
+  ]
+}

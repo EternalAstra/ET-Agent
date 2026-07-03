@@ -139,7 +139,9 @@ def run_scenario(mgr, scenario: dict, scenario_key: str) -> dict:
             mgr.pre_llm_call(sid, msgs)
 
             # Post-LLM: tool call or plain response
-            if _token_ids(abs(turn * 137 + hash(sid)))[0] % 100 < scenario["tool_call_probability"] * 100:
+            # hash(sid) can be huge; mask to avoid MemoryError in _token_ids()
+            _seed = (turn * 137 + (hash(sid) & 0xFFFF)) % 10000
+            if _token_ids(_seed)[0] % 100 < scenario["tool_call_probability"] * 100:
                 # Tool call
                 mgr.post_llm_call(
                     sid,
@@ -193,15 +195,14 @@ def main():
                         help="GPU VRAM in GB")
     args = parser.parse_args()
 
-    # Create memory manager
-    print(f"Initializing memory manager for {args.model} ({args.gpu_gb}GB GPU)...")
-    mgr = create_agent_memory_manager(args.model, gpu_gb=args.gpu_gb)
-    print(f"  Blocks: {mgr.allocator.total_blocks} total, "
-          f"{mgr._config.block_size} tokens/block")
-
     scenarios_to_run = list(SCENARIOS) if args.scenario == "all" else [args.scenario]
-
     all_results = {"metadata": {"model": args.model, "gpu_gb": args.gpu_gb}, "scenarios": {}}
+
+    _ref = create_agent_memory_manager(args.model, gpu_gb=args.gpu_gb)
+    print(f"Initializing memory manager for {args.model} ({args.gpu_gb}GB GPU)...")
+    print(f"  Blocks: {_ref.allocator.total_blocks} total, "
+          f"{_ref._config.block_size} tokens/block")
+    del _ref
 
     for key in scenarios_to_run:
         sc = SCENARIOS[key]
@@ -211,6 +212,8 @@ def main():
         print(f"  {sc['sessions']} sessions × {sc['turns']} turns")
         print(f"  Tools: {sc['tools']}")
 
+        # Fresh manager per scenario — reset_stats() does not free blocks
+        mgr = create_agent_memory_manager(args.model, gpu_gb=args.gpu_gb)
         result = run_scenario(mgr, sc, key)
         all_results["scenarios"][key] = result
 
@@ -223,14 +226,11 @@ def main():
             print(f"  Total migrations:    {summary['total_migrations']}")
             print(f"  Tokens saved:        {summary['total_tokens_saved']}")
 
-        # Reset between scenarios
-        mgr.reset_stats()
-
     # Export
     output_path = args.output
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(all_results, f, indent=2, default=str)
-    print(f"\n[✓] Results exported to {output_path}")
+    print(f"\n[OK] Results exported to {output_path}")
 
     # Write chart data for dashboard
     dash_dir = Path(args.dashboard_dir)
@@ -241,7 +241,7 @@ def main():
         f.write("window.BENCHMARK_DATA = ")
         json.dump(all_results, f, indent=2, default=str)
         f.write(";\n")
-    print(f"[✓] Dashboard data written to {chart_path}")
+    print(f"[OK] Dashboard data written to {chart_path}")
 
     # Print summary table
     print(f"\n{'='*60}")

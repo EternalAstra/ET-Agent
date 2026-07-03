@@ -346,6 +346,12 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     except Exception as exc:
         logger.warning("on_session_start hook failed: %s", exc)
 
+    try:
+        from agent.kv_memory_integration import on_session_start_kv
+        on_session_start_kv(agent, system_prompt=agent._cached_system_prompt or "")
+    except Exception as exc:
+        logger.debug("KV memory on_session_start failed: %s", exc)
+
     # Cold-start credits seed (L3) — fallback for the first-turn path. The TUI/
     # desktop build seeds at session OPEN (see seed_credits_at_session_start in
     # tui_gateway), so this call is usually a no-op there (idempotent: skips when
@@ -852,6 +858,12 @@ def run_conversation(
         # lone surrogates (U+D800-U+DFFF) that crash json.dumps() inside
         # the OpenAI SDK. Sanitizing here prevents the 3-retry cycle.
         _sanitize_messages_surrogates(api_messages)
+
+        try:
+            from agent.kv_memory_integration import pre_llm_call_kv
+            pre_llm_call_kv(agent, messages)
+        except Exception as exc:
+            logger.debug("KV pre_llm_call failed: %s", exc)
 
         # Calculate approximate request size for logging
         total_chars = sum(len(str(msg)) for msg in api_messages)
@@ -3552,6 +3564,16 @@ def run_conversation(
                     assistant_message.content = str(raw)
 
             try:
+                from agent.kv_memory_integration import post_llm_call_kv
+                post_llm_call_kv(
+                    agent,
+                    assistant_message,
+                    has_tool_calls=bool(getattr(assistant_message, "tool_calls", None)),
+                )
+            except Exception as exc:
+                logger.debug("KV post_llm_call failed: %s", exc)
+
+            try:
                 from hermes_cli.plugins import (
                     has_hook,
                     invoke_hook as _invoke_hook,
@@ -3970,6 +3992,16 @@ def run_conversation(
                         pass
 
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+
+                try:
+                    from agent.kv_memory_integration import on_tool_results_kv
+                    _tc_names = [
+                        tc.function.name
+                        for tc in (assistant_message.tool_calls or [])
+                    ]
+                    on_tool_results_kv(agent, _tc_names or None)
+                except Exception as exc:
+                    logger.debug("KV on_tool_result failed: %s", exc)
 
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision
