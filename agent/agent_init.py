@@ -1625,6 +1625,13 @@ def init_agent(
         except Exception as _ce_err:
             _ra().logger.debug("Context engine on_session_start: %s", _ce_err)
 
+    # Phase 5: KV Cache memory manager (ET-Agent)
+    try:
+        from agent.kv_memory_integration import init_kv_memory_manager
+        init_kv_memory_manager(agent)
+    except Exception as _kv_err:
+        _ra().logger.debug("KV memory manager init: %s", _kv_err)
+
     agent._subdirectory_hints = SubdirectoryHintTracker(
         working_dir=os.getenv("TERMINAL_CWD") or None,
     )

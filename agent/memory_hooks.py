@@ -143,7 +143,9 @@ class AgentMemoryManager:
         )
 
         self.lifecycle = LifecycleAwareKVManager(
-            timing=LifecycleTiming(),
+            timing=LifecycleTiming(
+                tool_call_gpu_to_cpu_s=1.0,  # was 30s — faster GPU release under tight VRAM
+            ),
             on_demote=self._on_demote,
             on_promote=self._on_promote,
             on_evict=self._on_evict,
@@ -163,7 +165,7 @@ class AgentMemoryManager:
 
         # ── Background scan timer ──
         self._scan_timer: Optional[threading.Timer] = None
-        self._scan_interval_s: float = 30.0
+        self._scan_interval_s: float = 5.0  # was 30s — match tighter demote policy
         self._start_scan_timer()
 
         # ── Stats ──
@@ -325,7 +327,7 @@ class AgentMemoryManager:
 
             # Insert the new hashes into the prefix cache (Phase 2)
             if uncached_tokens > 0 and new_blocks:
-                uncached_ids = token_ids[prefix_tokens // self._config.block_size:]
+                uncached_ids = token_ids[prefix_tokens:]
                 hashes = _compute_prefix_hashes(
                     uncached_ids, self._config.block_size,
                 )

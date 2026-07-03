@@ -3036,6 +3036,11 @@ class AIAgent:
                 )
             except Exception:
                 pass
+        try:
+            from agent.kv_memory_integration import on_session_end_kv
+            on_session_end_kv(self)
+        except Exception:
+            pass
 
     def commit_memory_session(self, messages: list = None) -> None:
         """Trigger end-of-session extraction without tearing providers down.
@@ -3061,6 +3066,11 @@ class AIAgent:
                 )
             except Exception:
                 pass
+        try:
+            from agent.kv_memory_integration import on_session_end_kv
+            on_session_end_kv(self)
+        except Exception:
+            pass
 
     def _sync_external_memory_for_turn(
         self,

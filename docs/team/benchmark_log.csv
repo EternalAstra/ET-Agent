@@ -1,0 +1,13 @@
+scenario,gpu_gb,model,date,hit_rate,migrations,tokens_saved,peak_gpu_blocks,exit_ok,notes
+chat,6,qwen2.5:3b-instruct,2026-07-02,65.0%,1334,273,-6621,yes,2sess×20turn
+tool_chain,6,qwen2.5:3b-instruct,2026-07-02,63.3%,2761,133,-6473,yes,2sess×10turn
+long_context,6,qwen2.5:3b-instruct,2026-07-02,,,,,no,OOM:需250块仅18块空闲
+parallel,6,qwen2.5:3b-instruct,2026-07-02,,,,,no,OOM:8并发会话超6GB预算
+lifecycle,6,qwen2.5:3b-instruct,2026-07-02,,,,,no,OOM:4sess×30turn超6GB预算
+chat,24,qwen2.5:3b-instruct,2026-07-02,65.0%,1034,273,-27686,yes,模块验证用
+tool_chain,24,qwen2.5:3b-instruct,2026-07-02,63.3%,3075,133,-27538,yes,工具链迁移最多之一
+long_context,24,qwen2.5:3b-instruct,2026-07-02,65.3%,8152,343,-27755,yes,压缩触发tokens_saved=343
+parallel,24,qwen2.5:3b-instruct,2026-07-02,66.1%,6547,833,-26142,yes,8sess共享前缀
+lifecycle,24,qwen2.5:3b-instruct,2026-07-02,66.1%,12523,833,-27262,yes,阶段切换压力最大
+parallel,6,qwen2.5:3b-instruct,2026-07-02,,,,,no,demote=1s scan=5s 仍OOM:需94块仅8块空闲
+long_context,6,qwen2.5:3b-instruct,2026-07-02,,,,,no,demote=1s scan=5s 仍OOM:需250块仅112块空闲
