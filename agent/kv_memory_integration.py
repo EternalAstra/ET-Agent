@@ -39,6 +39,20 @@ def init_kv_memory_manager(agent: Any) -> None:
         gpu_gb = int(kv_cfg.get("gpu_gb", 6))
         mgr = create_agent_memory_manager(bare, gpu_gb=gpu_gb)
         agent._kv_memory_manager = mgr
+
+        # ── Start monitor dashboard in background daemon thread ──
+        try:
+            from scripts.monitor_api import start_monitor_api, set_global_manager
+            set_global_manager(mgr)
+            import threading
+            _mon_port = int(kv_cfg.get("monitor_port", 8765))
+            threading.Thread(
+                target=lambda: start_monitor_api(port=_mon_port, blocking=True),
+                daemon=True, name="et-agent-monitor",
+            ).start()
+        except Exception:
+            pass
+
         if not getattr(agent, "quiet_mode", False):
             logger.info(
                 "KV memory manager enabled (model=%s, gpu_gb=%d, blocks=%d)",

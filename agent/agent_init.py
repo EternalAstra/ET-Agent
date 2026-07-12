@@ -1755,13 +1755,14 @@ def init_agent(
             "is_anthropic_oauth": agent._is_anthropic_oauth,
         })
 
-    # ── Memory Manager initialization (ET-Agent Phase 5) ──
-    # Lazy init: the full AgentMemoryManager is heavy (~93K blocks default).
-    # Only create it when explicitly requested via enable_memory_manager=True
-    # or when the memory-manager plugin discovers and activates it.
-    # The attribute is always set so callers can check for None.
-    agent._memory_manager = None
-    agent._memory_monitor = None
+    # ── ET-Agent Phase 5: KV Cache Memory Manager ──
+    agent._kv_memory_manager = None
+    agent._kv_memory_monitor = None
+    try:
+        from agent.kv_memory_integration import init_kv_memory_manager
+        init_kv_memory_manager(agent)
+    except Exception as _kv_err:
+        _ra().logger.debug("KV memory manager init: %s", _kv_err)
 
 
 

@@ -214,6 +214,15 @@ window.addEventListener('resize',drawAll);
 
 _global_manager = None
 
+# ── Cross-process stats bridge: hermes pushes → monitor caches → dashboard reads ──
+_pushed_stats: dict = {}
+_pushed_at: float = 0.0
+PUSH_STALENESS_S = 5.0  # show "waiting" if no push for this many seconds
+
+
+def _is_push_fresh() -> bool:
+    return (time.time() - _pushed_at) < PUSH_STALENESS_S
+
 
 def set_global_manager(mgr):
     """Register the active AgentMemoryManager so the API can read from it."""
@@ -277,102 +286,109 @@ class MonitorHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def do_POST(self):
+        if self.path == "/api/push":
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length)
+            try:
+                data = json.loads(body.decode("utf-8"))
+                global _pushed_stats, _pushed_at
+                _pushed_stats = data
+                _pushed_at = time.time()
+                self._send_json({"ok": True, "pushed": _pushed_at})
+            except Exception as e:
+                self._send_json({"ok": False, "error": str(e)}, 400)
+        else:
+            self._send_json({"error": "not found"}, 404)
+
+    def _build_snapshot(self, mgr):
+        """Build a snapshot dict from a live AgentMemoryManager."""
+        s = mgr.stats()
+        a = s.get("allocator", {})
+        h = s.get("hierarchical_store", {})
+        p = s.get("prefix_cache", {})
+        l = s.get("lifecycle", {})
+        c = s.get("compressor", {})
+        d = s.get("deduplicator", {})
+        t = s.get("tool_compressor", {})
+
+        used = a.get("used_blocks", 0)
+        prefix_entries = p.get("total_entries", 0)
+        filled_blocks = min(prefix_entries, max(used, 1))
+        waste_rate = round(1.0 - (filled_blocks / max(used, 1)), 4) if used > 0 else 0.0
+
+        demotions = l.get("total_demotions", 0)
+        promotions = l.get("total_promotions", 0)
+        total_acts = max(demotions + promotions, 1)
+        release_rate = round(min(demotions / total_acts, 1.0), 4)
+
+        return {
+            "timestamp": time.time(), "blocks": {
+                "total": a.get("total_blocks", 0), "free": a.get("free_blocks", 0),
+                "used": used, "gpu_blocks": h.get("gpu_blocks", 0),
+                "cpu_blocks": h.get("cpu_blocks", 0), "ssd_blocks": h.get("ssd_blocks", 0),
+                "shared": a.get("shared_blocks", 0), "pinned": a.get("pinned_blocks", 0),
+                "waste_rate": waste_rate, "tool_wait_release_rate": release_rate,
+            }, "prefix": {
+                "total_entries": p.get("total_entries", 0),
+                "pinned_entries": p.get("pinned_entries", 0),
+                "hot_entries": p.get("hot_entries", 0),
+                "hit_rate": p.get("hit_rate", 0.0),
+                "blocks_reused": p.get("blocks_reused", 0),
+            }, "tiers": {
+                "gpu_bytes": h.get("gpu_usage_bytes", 0),
+                "cpu_bytes": h.get("cpu_usage_bytes", 0),
+                "ssd_bytes": h.get("ssd_usage_bytes", 0),
+                "gpu_ratio": h.get("gpu_usage_ratio", 0.0),
+                "cpu_ratio": h.get("cpu_usage_ratio", 0.0),
+                "total_migrations": h.get("total_migrations", 0),
+                "total_prefetches": h.get("total_prefetches", 0),
+            }, "lifecycle": {
+                "active_requests": l.get("active_requests", 0),
+                "waiting_requests": l.get("waiting_requests", 0),
+                "prefill_count": l.get("phases", {}).get("PREFILL", 0),
+                "decoding_count": l.get("phases", {}).get("DECODING", 0),
+                "tool_call_count": l.get("phases", {}).get("TOOL_CALL", 0),
+                "idle_count": l.get("phases", {}).get("IDLE", 0),
+                "completed_count": l.get("phases", {}).get("COMPLETED", 0),
+                "total_demotions": demotions, "total_promotions": promotions,
+            }, "compression": {
+                "total_tokens_saved": int(c.get("total_tokens_saved", 0) + d.get("total_tokens_saved", 0) + t.get("total_tokens_saved", 0)),
+                "total_history_compressions": c.get("total_history_compressions", 0),
+                "total_messages_dropped": d.get("total_messages_dropped", 0),
+            },
+        }
+
     def do_GET(self):
         if self.path == "/" or self.path == "/index.html":
             self._send_html(DASHBOARD_HTML)
 
         elif self.path == "/api/snapshot":
-            mgr = get_global_manager()
-            if mgr is None:
-                # Return zero-filled placeholder so dashboard stays alive
-                self._send_json({
-                    "timestamp": time.time(),
-                    "blocks": {"total":0,"free":0,"used":0,"gpu_blocks":0,"cpu_blocks":0,"ssd_blocks":0,"shared":0,"pinned":0,"waste_rate":0,"tool_wait_release_rate":0},
-                    "prefix": {"total_entries":0,"pinned_entries":0,"hot_entries":0,"hit_rate":0,"blocks_reused":0},
-                    "tiers": {"gpu_bytes":0,"cpu_bytes":0,"ssd_bytes":0,"gpu_ratio":0,"cpu_ratio":0,"total_migrations":0,"total_prefetches":0},
-                    "lifecycle": {"active_requests":0,"waiting_requests":0,"prefill_count":0,"decoding_count":0,"tool_call_count":0,"idle_count":0,"completed_count":0,"total_demotions":0,"total_promotions":0},
-                    "compression": {"total_tokens_saved":0,"total_history_compressions":0,"total_messages_dropped":0},
-                    "_waiting": True
-                })
+            # Priority 1: stats pushed from hermes via POST /api/push (cross-process bridge)
+            if _is_push_fresh():
+                result = dict(_pushed_stats)
+                result["_live"] = True
+                self._send_json(result)
                 return
 
-            s = mgr.stats()
-            a = s.get("allocator", {})
-            h = s.get("hierarchical_store", {})
-            p = s.get("prefix_cache", {})
-            l = s.get("lifecycle", {})
-            c = s.get("compressor", {})
-            d = s.get("deduplicator", {})
-            t = s.get("tool_compressor", {})
+            # Priority 2: in-process manager (demo benchmark or embedded agent)
+            mgr = get_global_manager()
+            if mgr is not None:
+                result = self._build_snapshot(mgr)
+                result["_live"] = True
+                self._send_json(result)
+                return
 
-            used = a.get("used_blocks", 0)
-            free = a.get("free_blocks", 0)
-            # Waste rate: among allocated blocks, what fraction of token slots is empty?
-            # PagedAttention achieves ~3.7% waste (vLLM paper Fig.2).
-            # We estimate: total token capacity = used_blocks * block_size
-            #              actual tokens ≈ prefix entries * block_size (cached blocks are "full")
-            #              internal waste = (unfilled_slots) / capacity
-            # Waste rate: fraction of allocated block SLOTS that are empty.
-            # PagedAttention: only the last block per request is partially filled.
-            # Waste ≈ (unfilled_slots) / (total_allocated_capacity).
-            # We estimate: total entries ≈ total filled blocks, remaining = waste.
-            prefix_entries = p.get("total_entries", 0)
-            filled_blocks = min(prefix_entries, max(used, 1))
-            waste_rate = round(1.0 - (filled_blocks / max(used, 1)), 4)
-
-            demotions = l.get("total_demotions", 0)
-            promotions = l.get("total_promotions", 0)
-            total_acts = max(demotions + promotions, 1)
-            release_rate = round(min(demotions / total_acts, 1.0), 4)
-
-            result = {
+            # No data source yet
+            self._send_json({
                 "timestamp": time.time(),
-                "blocks": {
-                    "total": a.get("total_blocks", 0),
-                    "free": free,
-                    "used": used,
-                    "gpu_blocks": h.get("gpu_blocks", 0),
-                    "cpu_blocks": h.get("cpu_blocks", 0),
-                    "ssd_blocks": h.get("ssd_blocks", 0),
-                    "shared": a.get("shared_blocks", 0),
-                    "pinned": a.get("pinned_blocks", 0),
-                    "waste_rate": waste_rate,
-                    "tool_wait_release_rate": release_rate,
-                },
-                "prefix": {
-                    "total_entries": p.get("total_entries", 0),
-                    "pinned_entries": p.get("pinned_entries", 0),
-                    "hot_entries": p.get("hot_entries", 0),
-                    "hit_rate": p.get("hit_rate", 0.0),
-                    "blocks_reused": p.get("blocks_reused", 0),
-                },
-                "tiers": {
-                    "gpu_bytes": h.get("gpu_usage_bytes", 0),
-                    "cpu_bytes": h.get("cpu_usage_bytes", 0),
-                    "ssd_bytes": h.get("ssd_usage_bytes", 0),
-                    "gpu_ratio": h.get("gpu_usage_ratio", 0.0),
-                    "cpu_ratio": h.get("cpu_usage_ratio", 0.0),
-                    "total_migrations": h.get("total_migrations", 0),
-                    "total_prefetches": h.get("total_prefetches", 0),
-                },
-                "lifecycle": {
-                    "active_requests": l.get("active_requests", 0),
-                    "waiting_requests": l.get("waiting_requests", 0),
-                    "prefill_count": l.get("phases", {}).get("PREFILL", 0),
-                    "decoding_count": l.get("phases", {}).get("DECODING", 0),
-                    "tool_call_count": l.get("phases", {}).get("TOOL_CALL", 0),
-                    "idle_count": l.get("phases", {}).get("IDLE", 0),
-                    "completed_count": l.get("phases", {}).get("COMPLETED", 0),
-                    "total_demotions": demotions,
-                    "total_promotions": promotions,
-                },
-                "compression": {
-                    "total_tokens_saved": int(c.get("total_tokens_saved", 0) + d.get("total_tokens_saved", 0) + t.get("total_tokens_saved", 0)),
-                    "total_history_compressions": c.get("total_history_compressions", 0),
-                    "total_messages_dropped": d.get("total_messages_dropped", 0),
-                },
-            }
-            self._send_json(result)
+                "blocks": {"total":0,"free":0,"used":0,"gpu_blocks":0,"cpu_blocks":0,"ssd_blocks":0,"shared":0,"pinned":0,"waste_rate":0,"tool_wait_release_rate":0},
+                "prefix": {"total_entries":0,"pinned_entries":0,"hot_entries":0,"hit_rate":0,"blocks_reused":0},
+                "tiers": {"gpu_bytes":0,"cpu_bytes":0,"ssd_bytes":0,"gpu_ratio":0,"cpu_ratio":0,"total_migrations":0,"total_prefetches":0},
+                "lifecycle": {"active_requests":0,"waiting_requests":0,"prefill_count":0,"decoding_count":0,"tool_call_count":0,"idle_count":0,"completed_count":0,"total_demotions":0,"total_promotions":0},
+                "compression": {"total_tokens_saved":0,"total_history_compressions":0,"total_messages_dropped":0},
+                "_waiting": True
+            })
 
         else:
             self._send_json({"error": "not found"}, 404)
