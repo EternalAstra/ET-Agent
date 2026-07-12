@@ -624,6 +624,17 @@ class AgentMemoryManager:
 # Convenience factory
 # ---------------------------------------------------------------------------
 
+# ── Global reference for the monitor API server ──
+# When create_agent_memory_manager() is called, it stores the instance here
+# so scripts/monitor_api.py can find it without needing an Agent object.
+_global_manager_instance = None
+
+
+def get_global_memory_manager():
+    """Return the most recently created AgentMemoryManager, or None."""
+    return _global_manager_instance
+
+
 def create_agent_memory_manager(
     model_name: str = "qwen2.5-7b",
     gpu_gb: int = 80,
@@ -650,4 +661,7 @@ def create_agent_memory_manager(
     """
     config = MemoryConfig.for_model(model_name, block_size=block_size, gpu_gb=gpu_gb)
     config.enable_ssd = enable_ssd
-    return AgentMemoryManager(config=config, model_name=model_name)
+    mgr = AgentMemoryManager(config=config, model_name=model_name)
+    global _global_manager_instance
+    _global_manager_instance = mgr
+    return mgr

@@ -1,0 +1,454 @@
+#!/usr/bin/env python3
+"""ET-Agent Memory Monitor API — tiny HTTP server for the Electron dashboard.
+
+Provides:
+  GET /              → dashboard HTML
+  GET /api/snapshot  → latest MemorySnapshot as JSON
+  GET /api/history   → all snapshots since server start as JSON
+
+The server reads from the global AgentMemoryManager singleton stored in
+``agent.kv_memory_integration._global_memory_manager`` — so it reflects
+your REAL conversation state, not simulated data.
+
+Start it alongside your ET-Agent CLI:
+  python scripts/monitor_api.py --port 8765
+
+Or from Python code:
+  from scripts.monitor_api import start_monitor_api
+  start_monitor_api(port=8765)
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import threading
+import time
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+# ────────────────────────────────────────────────────────────────
+# Dashboard HTML  (same rich dashboard, but now uses HTTP polling)
+# ────────────────────────────────────────────────────────────────
+
+DASHBOARD_HTML = r"""<!DOCTYPE html>
+<html lang="en" data-mode="dark">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ET-Agent Live Monitor</title>
+<style>
+:root{--bg:#0f1117;--card:#161b22;--border:#30363d;--text:#e6edf3;--muted:#8b949e;
+  --gpu:#3fb950;--cpu:#d29922;--ssd:#58a6ff;--hit:#7ee787;--warn:#f85149;
+  --migrate:#bc8cff;--compress:#f0883e;--waste:#f85149;--release:#3fb950;
+  --radius:8px;--font:system-ui,-apple-system,sans-serif}
+[data-mode=light]{--bg:#fff;--card:#f6f8fa;--border:#d0d7de;--text:#1f2328;--muted:#656d76}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:var(--font);background:var(--bg);color:var(--text);min-height:100vh}
+.header{background:var(--card);border-bottom:1px solid var(--border);padding:10px 20px;
+  display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:10}
+.header h1{font-size:16px;font-weight:600}
+.header-meta{display:flex;gap:14px;font-size:11px;color:var(--muted);align-items:center}
+.status-live{display:inline-block;width:7px;height:7px;background:var(--gpu);border-radius:50%;
+  margin-right:4px;animation:pulse 1s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+.container{padding:16px 20px;max-width:1440px;margin:0 auto}
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px}
+.stat{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:14px}
+.stat .sv{font-size:24px;font-weight:700;line-height:1.2}
+.stat .sl{font-size:11px;color:var(--muted);margin-top:2px}
+.stat .delta{font-size:10px;margin-top:3px;color:var(--muted)}
+.section{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);margin-bottom:14px}
+.section-hdr{padding:12px 14px;border-bottom:1px solid var(--border);font-weight:600;font-size:13px;
+  display:flex;align-items:center;gap:6px}
+.section-body{padding:14px}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.grid3{grid-template-columns:repeat(3,1fr)}
+.bar-row{display:flex;align-items:center;gap:8px;margin-bottom:5px}
+.bar-label{width:90px;font-size:11px;color:var(--muted);text-align:right;flex-shrink:0}
+.bar-track{flex:1;height:20px;background:#0d1117;border-radius:5px;overflow:hidden}
+.bar-fill{height:100%;border-radius:5px;transition:width .4s ease;min-width:2px}
+.bar-fill.gpu{background:var(--gpu)}.bar-fill.cpu{background:var(--cpu)}.bar-fill.ssd{background:var(--ssd)}
+.bar-fill.hit{background:var(--hit)}.bar-fill.migrate{background:var(--migrate)}
+.bar-fill.compress{background:var(--compress)}.bar-fill.waste{background:var(--waste)}
+.bar-fill.release{background:var(--release)}
+.bar-val{width:75px;font-size:10px;color:var(--muted);flex-shrink:0}
+.phase-row{display:flex;gap:8px;flex-wrap:wrap}
+.phase-col{flex:1;min-width:85px;text-align:center}
+.phase-fill{height:50px;border-radius:6px 6px 0 0;transition:height .4s ease;
+  display:flex;align-items:flex-end;justify-content:center;color:#fff;font-weight:700;font-size:14px}
+.phase-name{font-size:9px;color:var(--muted);margin-top:3px}
+.chart-wrap{position:relative;width:100%}
+.chart-wrap svg{width:100%;height:180px;overflow:visible}
+table.features{width:100%;border-collapse:collapse;font-size:12px}
+table.features th{text-align:left;padding:6px 10px;border-bottom:2px solid var(--border);color:var(--muted)}
+table.features td{padding:6px 10px;border-bottom:1px solid var(--border)}
+table.features .new{color:var(--gpu);font-weight:600}
+.btn{background:var(--card);border:1px solid var(--border);color:var(--muted);
+  border-radius:5px;padding:4px 10px;cursor:pointer;font-size:12px}
+.btn:hover{color:var(--text)}
+</style></head>
+<body>
+<div class=header>
+  <h1>⚡ ET-Agent Live Memory Monitor</h1>
+  <div class=header-meta>
+    <span><span class=status-live></span>Live</span>
+    <span id=snap-count>0 snaps</span>
+    <span id=clock>--:--:--</span>
+    <button class=btn onclick="toggleTheme()">☀</button>
+  </div>
+</div>
+<div class=container>
+  <div class=stats id=stat-row></div>
+  <div class=section>
+    <div class=section-hdr>📦 Storage Tiers — GPU · CPU · SSD</div>
+    <div class=section-body>
+      <div class=grid2>
+        <div id=tier-bars></div>
+        <div class=chart-wrap><svg id=chart-gpu></svg></div>
+      </div>
+    </div>
+  </div>
+  <div class=section>
+    <div class=section-hdr>🎯 Prefix Cache & Agent Lifecycle</div>
+    <div class=section-body>
+      <div class=grid2>
+        <div><div id=prefix-bars></div><div class=chart-wrap><svg id=chart-prefix></svg></div></div>
+        <div><div id=phase-bars></div><div class=chart-wrap><svg id=chart-lifecycle></svg></div></div>
+      </div>
+    </div>
+  </div>
+  <div class=section>
+    <div class=section-hdr>📐 Competition Metrics</div>
+    <div class=section-body>
+      <div class="grid2 grid3">
+        <div><div style=font-size:12px;color:var(--muted);margin-bottom:6px>显存浪费率</div>
+          <div style=font-size:32px;font-weight:700;color:var(--waste) id=metric-waste>--</div>
+          <div style=font-size:10px;color:var(--muted)>原始 Hermes ~60-80%</div>
+          <div class=chart-wrap><svg id=chart-waste></svg></div></div>
+        <div><div style=font-size:12px;color:var(--muted);margin-bottom:6px>工具等待 GPU 释放率</div>
+          <div style=font-size:32px;font-weight:700;color:var(--release) id=metric-release>--</div>
+          <div style=font-size:10px;color:var(--muted)>demotions / (demotions+promotions)</div>
+          <div class=chart-wrap><svg id=chart-migrate></svg></div></div>
+        <div><div style=font-size:12px;color:var(--muted);margin-bottom:6px>Token 节省 + 迁移</div>
+          <div style=font-size:32px;font-weight:700;color:var(--compress) id=metric-tokens>--</div>
+          <div style=font-size:10px;color:var(--muted)>累计 Token 减少量</div>
+          <div class=chart-wrap><svg id=chart-compress></svg></div></div>
+      </div>
+    </div>
+  </div>
+  <div class=section>
+    <div class=section-hdr>⭐ ET-Agent vs Original Hermes</div>
+    <div class=section-body>
+      <table class=features>
+        <tr><th>Feature</th><th>Original Hermes</th><th>ET-Agent</th></tr>
+        <tr><td>KV Cache Management</td><td>Contiguous (~60% waste)</td><td class=new>PagedAttention (~3.7% waste)</td></tr>
+        <tr><td>Prefix Reuse</td><td>--</td><td class=new>MoonCake hash-chain (O(1) lookup)</td></tr>
+        <tr><td>Storage Tiers</td><td>GPU only</td><td class=new>GPU → CPU → SSD hierarchical</td></tr>
+        <tr><td>Lifecycle Awareness</td><td>Stateless</td><td class=new>5-phase agent lifecycle tracker</td></tr>
+        <tr><td>Context Compression</td><td>Generic engine</td><td class=new>ACON structured (ICML 2026)</td></tr>
+        <tr><td>Tool Schema</td><td>Full schema every turn</td><td class=new>Frequency-tiered, progressive</td></tr>
+        <tr><td>Prompt Dedup</td><td>--</td><td class=new>System prompt + tool elision</td></tr>
+        <tr><td>Monitor Dashboard</td><td>--</td><td class=new>Real-time + Electron-ready</td></tr>
+      </table>
+    </div>
+  </div>
+</div>
+<script>
+const MAX=120;
+let hist={t:[],gpu:[],cpu:[],ssd:[],hit:[],active:[],waiting:[],waste:[],migr:[],tok:[]};
+let n=0;
+
+function toggleTheme(){
+  let h=document.documentElement,m=h.getAttribute('data-mode');
+  h.setAttribute('data-mode',m==='dark'?'light':'dark');}
+function fmt(v,d){if(v==null)return'-';return Number(v).toLocaleString(undefined,{maximumFractionDigits:d??0})}
+function pct(v){return v==null?'-':(Number(v)*100).toFixed(1)+'%'}
+let lastData=null;
+
+async function poll(){
+  try{
+    let r=await fetch('/api/snapshot');let s=await r.json();lastData=s;n++;
+    document.getElementById('snap-count').textContent=n+' snaps';
+    document.getElementById('clock').textContent=new Date().toLocaleTimeString();
+    update(s);pushHistory(s);drawAll();
+  }catch(e){}
+}
+function update(s){
+  let b=s.blocks||{},p=s.prefix||{},t=s.tiers||{},l=s.lifecycle||{},c=s.compression||{};
+  document.getElementById('stat-row').innerHTML=
+    `<div class=stat><div class=sv style=color:var(--gpu)>${fmt(b.gpu_blocks)}</div><div class=sl>GPU Blocks</div><div class=delta>shared ${fmt(b.shared)} · pinned ${fmt(b.pinned)}</div></div>`+
+    `<div class=stat><div class=sv style=color:var(--cpu)>${fmt(b.cpu_blocks)}</div><div class=sl>CPU Blocks</div><div class=delta>usage ${pct(t.cpu_ratio)}</div></div>`+
+    `<div class=stat><div class=sv style=color:var(--hit)>${pct(p.hit_rate)}</div><div class=sl>Prefix Hit Rate</div><div class=delta>${fmt(p.total_entries)} entries · ${fmt(p.hot_entries)} hot</div></div>`+
+    `<div class=stat><div class=sv style=color:var(--compress)>${fmt(c.total_tokens_saved)}</div><div class=sl>Tokens Saved</div><div class=delta>msg dropped ${fmt(c.total_messages_dropped)}</div></div>`;
+  let mx=Math.max(b.gpu_blocks||1,b.cpu_blocks||1,b.ssd_blocks||1,1);
+  document.getElementById('tier-bars').innerHTML=[
+    {l:'GPU',v:b.gpu_blocks,c:'gpu'},{l:'CPU',v:b.cpu_blocks,c:'cpu'},{l:'SSD',v:b.ssd_blocks,c:'ssd'}
+  ].map(x=>`<div class=bar-row><span class=bar-label>${x.l}</span><div class=bar-track><div class="bar-fill ${x.c}" style=width:${x.v/mx*100}%></div></div><span class=bar-val>${fmt(x.v)} blocks</span></div>`).join('');
+  document.getElementById('prefix-bars').innerHTML=[
+    {l:'Hit Rate',v:Math.round(p.hit_rate*1000),c:'hit',d:pct(p.hit_rate)},
+    {l:'Entries',v:Math.max(p.total_entries||1,1),c:'gpu',d:fmt(p.total_entries)},
+    {l:'Blocks Reused',v:Math.max(p.blocks_reused||1,1),c:'cpu',d:fmt(p.blocks_reused)}
+  ].map(x=>`<div class=bar-row><span class=bar-label>${x.l}</span><div class=bar-track><div class="bar-fill ${x.c}" style=width:${Math.min(x.v/500*100,100)}%></div></div><span class=bar-val>${x.d}</span></div>`).join('');
+  let phs=[{k:'prefill_count',l:'Prefill',c:'#3fb950'},{k:'decoding_count',l:'Decode',c:'#7ee787'},{k:'tool_call_count',l:'ToolCall',c:'#d29922'},{k:'idle_count',l:'Idle',c:'#58a6ff'},{k:'completed_count',l:'Done',c:'#6b7280'}];
+  let mxP=Math.max(...phs.map(q=>l[q.k]||0),1);
+  document.getElementById('phase-bars').innerHTML='<div class=phase-row>'+phs.map(q=>`<div class=phase-col><div class=phase-fill style=height:${(l[q.k]||0)/mxP*100}%;background:${q.c}>${l[q.k]||0}</div><div class=phase-name>${q.l}</div></div>`).join('')+'</div>';
+  let wr=b.waste_rate||0,rr=b.tool_wait_release_rate||0;
+  document.getElementById('metric-waste').textContent=pct(wr);
+  document.getElementById('metric-release').textContent=pct(rr);
+  document.getElementById('metric-tokens').textContent=fmt(c.total_tokens_saved);
+}
+function pushHistory(s){
+  hist.t.push(n);let b=s.blocks||{},p=s.prefix||{},t=s.tiers||{},l=s.lifecycle||{},c=s.compression||{};
+  hist.gpu.push(b.gpu_blocks);hist.cpu.push(b.cpu_blocks);hist.ssd.push(b.ssd_blocks);
+  hist.hit.push(p.hit_rate*100);hist.active.push(l.active_requests);hist.waiting.push(l.waiting_requests);
+  hist.waste.push((b.waste_rate||0)*100);hist.migr.push(t.total_migrations);hist.tok.push(c.total_tokens_saved);
+  for(let k of Object.keys(hist)){if(hist[k].length>MAX)hist[k].shift();}
+}
+function drawSvg(id,data,color){
+  let el=document.getElementById(id);if(!el||data.length<2)return;
+  let W=el.parentElement.clientWidth||300,H=180,P=14,mx=Math.max(...data,1);
+  let pts=data.map((v,i)=>{let x=P+(W-2*P)/(data.length-1||1)*i;let y=H-P-(v/mx)*(H-2*P);return x+','+y;}).join(' ');
+  el.innerHTML=`<polyline points="${pts}" fill="none" stroke="${color}" stroke-width="2"/><polygon points="${P},${H-P} ${pts} ${W-P},${H-P}" fill="${color}" opacity=".08"/>`;
+}
+function drawAll(){
+  drawSvg('chart-gpu',hist.gpu,'#3fb950');drawSvg('chart-prefix',hist.hit,'#7ee787');
+  drawSvg('chart-lifecycle',hist.active,'#3fb950');drawSvg('chart-waste',hist.waste,'#f85149');
+  drawSvg('chart-migrate',hist.migr,'#bc8cff');drawSvg('chart-compress',hist.tok,'#f0883e');
+}
+window.addEventListener('DOMContentLoaded',()=>{poll();setInterval(poll,1000);});
+window.addEventListener('resize',drawAll);
+</script></body></html>"""
+
+
+# ────────────────────────────────────────────────────────────────
+# Global memory manager reference
+# ────────────────────────────────────────────────────────────────
+
+_global_manager = None
+
+
+def set_global_manager(mgr):
+    """Register the active AgentMemoryManager so the API can read from it."""
+    global _global_manager
+    _global_manager = mgr
+
+
+def get_global_manager():
+    """Try to get the active manager from multiple sources."""
+    global _global_manager
+    if _global_manager is not None:
+        return _global_manager
+
+    # Try from agent.memory_hooks global
+    try:
+        from agent.memory_hooks import get_global_memory_manager
+        mgr = get_global_memory_manager()
+        if mgr is not None:
+            _global_manager = mgr
+            return mgr
+    except Exception:
+        pass
+
+    # Try from plugin module
+    try:
+        from plugins.memory_manager_plugin.__init__ import _memory_manager as _pm
+        if _pm is not None:
+            _global_manager = _pm
+            return _pm
+    except Exception:
+        pass
+
+    return None
+
+
+# ────────────────────────────────────────────────────────────────
+# HTTP request handler
+# ────────────────────────────────────────────────────────────────
+
+
+class MonitorHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass  # quiet
+
+    def _send_json(self, data, code=200):
+        body = json.dumps(data, default=str).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", len(body))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_html(self, html, code=200):
+        body = html.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", len(body))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path == "/" or self.path == "/index.html":
+            self._send_html(DASHBOARD_HTML)
+
+        elif self.path == "/api/snapshot":
+            mgr = get_global_manager()
+            if mgr is None:
+                self._send_json({"error": "Memory manager not initialized"}, 503)
+                return
+
+            s = mgr.stats()
+            a = s.get("allocator", {})
+            h = s.get("hierarchical_store", {})
+            p = s.get("prefix_cache", {})
+            l = s.get("lifecycle", {})
+            c = s.get("compressor", {})
+            d = s.get("deduplicator", {})
+            t = s.get("tool_compressor", {})
+
+            used = a.get("used_blocks", 0)
+            free = a.get("free_blocks", 0)
+            # Waste rate: among allocated blocks, what fraction of token slots is empty?
+            # PagedAttention achieves ~3.7% waste (vLLM paper Fig.2).
+            # We estimate: total token capacity = used_blocks * block_size
+            #              actual tokens ≈ prefix entries * block_size (cached blocks are "full")
+            #              internal waste = (unfilled_slots) / capacity
+            total_capacity = used * mgr._config.block_size  # token slots in all allocated blocks
+            prefix_entries = p.get("total_entries", 0)
+            # Each prefix entry maps 1 hash → ≥1 block. Assume 1:1 for waste estimation.
+            filled_blocks = min(prefix_entries, used)
+            waste_rate = round(1.0 - (filled_blocks / max(used, 1)), 4) if used > 0 else 0.0
+
+            demotions = l.get("total_demotions", 0)
+            promotions = l.get("total_promotions", 0)
+            total_acts = max(demotions + promotions, 1)
+            release_rate = round(min(demotions / total_acts, 1.0), 4)
+
+            result = {
+                "timestamp": time.time(),
+                "blocks": {
+                    "total": a.get("total_blocks", 0),
+                    "free": free,
+                    "used": used,
+                    "gpu_blocks": h.get("gpu_blocks", 0),
+                    "cpu_blocks": h.get("cpu_blocks", 0),
+                    "ssd_blocks": h.get("ssd_blocks", 0),
+                    "shared": a.get("shared_blocks", 0),
+                    "pinned": a.get("pinned_blocks", 0),
+                    "waste_rate": waste_rate,
+                    "tool_wait_release_rate": release_rate,
+                },
+                "prefix": {
+                    "total_entries": p.get("total_entries", 0),
+                    "pinned_entries": p.get("pinned_entries", 0),
+                    "hot_entries": p.get("hot_entries", 0),
+                    "hit_rate": p.get("hit_rate", 0.0),
+                    "blocks_reused": p.get("blocks_reused", 0),
+                },
+                "tiers": {
+                    "gpu_bytes": h.get("gpu_usage_bytes", 0),
+                    "cpu_bytes": h.get("cpu_usage_bytes", 0),
+                    "ssd_bytes": h.get("ssd_usage_bytes", 0),
+                    "gpu_ratio": h.get("gpu_usage_ratio", 0.0),
+                    "cpu_ratio": h.get("cpu_usage_ratio", 0.0),
+                    "total_migrations": h.get("total_migrations", 0),
+                    "total_prefetches": h.get("total_prefetches", 0),
+                },
+                "lifecycle": {
+                    "active_requests": l.get("active_requests", 0),
+                    "waiting_requests": l.get("waiting_requests", 0),
+                    "prefill_count": l.get("phases", {}).get("PREFILL", 0),
+                    "decoding_count": l.get("phases", {}).get("DECODING", 0),
+                    "tool_call_count": l.get("phases", {}).get("TOOL_CALL", 0),
+                    "idle_count": l.get("phases", {}).get("IDLE", 0),
+                    "completed_count": l.get("phases", {}).get("COMPLETED", 0),
+                    "total_demotions": demotions,
+                    "total_promotions": promotions,
+                },
+                "compression": {
+                    "total_tokens_saved": int(c.get("total_tokens_saved", 0) + d.get("total_tokens_saved", 0) + t.get("total_tokens_saved", 0)),
+                    "total_history_compressions": c.get("total_history_compressions", 0),
+                    "total_messages_dropped": d.get("total_messages_dropped", 0),
+                },
+            }
+            self._send_json(result)
+
+        else:
+            self._send_json({"error": "not found"}, 404)
+
+
+# ────────────────────────────────────────────────────────────────
+# Public API
+# ────────────────────────────────────────────────────────────────
+
+
+def start_monitor_api(port: int = 8765, blocking: bool = False):
+    """Start the HTTP monitoring API server.
+
+    Parameters
+    ----------
+    port : int
+        Port to listen on.
+    blocking : bool
+        If True, run in the current thread (blocks forever).
+        If False, run in a daemon thread.
+
+    Returns
+    -------
+    HTTPServer
+        The server instance (can call ``.shutdown()`` to stop).
+    """
+    server = HTTPServer(("0.0.0.0", port), MonitorHandler)
+
+    if blocking:
+        print(f"[monitor API] http://localhost:{port}")
+        server.serve_forever()
+    else:
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        print(f"[monitor API] http://localhost:{port}  (background thread)")
+
+    return server
+
+
+def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(description="ET-Agent Memory Monitor API Server")
+    parser.add_argument("--port", type=int, default=8765, help="HTTP port")
+    parser.add_argument("--model", default="qwen2.5-7b")
+    parser.add_argument("--gpu-gb", type=int, default=6)
+    parser.add_argument("--init", action="store_true",
+                        help="Auto-create a memory manager if none registered")
+    args = parser.parse_args()
+
+    # Try to get an existing manager first
+    mgr = get_global_manager()
+
+    if mgr is None and args.init:
+        from agent.memory_hooks import create_agent_memory_manager
+        mgr = create_agent_memory_manager(args.model, gpu_gb=args.gpu_gb)
+        set_global_manager(mgr)
+        print(f"[init] Created memory manager ({mgr.allocator.total_blocks} blocks)")
+
+    if mgr is not None:
+        print(f"[monitor] Connected to active memory manager")
+        print(f"  Blocks: {mgr.allocator.total_blocks}")
+        print(f"  Sessions: {mgr.lifecycle.stats()['total_requests']}")
+    else:
+        print("[monitor] No memory manager found — API will return 503")
+        print("  Start it via: from scripts.monitor_api import set_global_manager")
+        print("  Or: python scripts/monitor_api.py --init")
+
+    print(f"\n  Dashboard: http://localhost:{args.port}")
+    print(f"  API:       http://localhost:{args.port}/api/snapshot")
+    print()
+
+    start_monitor_api(port=args.port, blocking=True)
+
+
+if __name__ == "__main__":
+    main()

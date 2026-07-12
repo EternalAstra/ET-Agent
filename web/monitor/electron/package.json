@@ -1,0 +1,13 @@
+{
+  "name": "et-agent-monitor",
+  "version": "0.0.1",
+  "description": "ET-Agent Real-Time Memory Monitor",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --dev"
+  },
+  "dependencies": {
+    "electron": "^31.0.0"
+  }
+}
