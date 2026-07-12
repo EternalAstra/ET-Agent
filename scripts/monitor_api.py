@@ -161,6 +161,7 @@ async function poll(){
   }catch(e){}
 }
 function update(s){
+  if(s._waiting){document.getElementById('stat-row').innerHTML='<div class=stat style=grid-column:1/-1;text-align:center;padding:24px><div style=font-size:16px;color:var(--cpu)>⏳ Waiting for hermes agent to connect...</div><div style=font-size:11px;color:var(--muted);margin-top:4px>Start hermes in another terminal to see live memory data</div></div>';document.getElementById('tier-bars').innerHTML='';document.getElementById('phase-bars').innerHTML='';return;}
   let b=s.blocks||{},p=s.prefix||{},t=s.tiers||{},l=s.lifecycle||{},c=s.compression||{};
   document.getElementById('stat-row').innerHTML=
     `<div class=stat><div class=sv style=color:var(--gpu)>${fmt(b.gpu_blocks)}</div><div class=sl>GPU Blocks</div><div class=delta>shared ${fmt(b.shared)} · pinned ${fmt(b.pinned)}</div></div>`+
@@ -283,7 +284,16 @@ class MonitorHandler(BaseHTTPRequestHandler):
         elif self.path == "/api/snapshot":
             mgr = get_global_manager()
             if mgr is None:
-                self._send_json({"error": "Memory manager not initialized"}, 503)
+                # Return zero-filled placeholder so dashboard stays alive
+                self._send_json({
+                    "timestamp": time.time(),
+                    "blocks": {"total":0,"free":0,"used":0,"gpu_blocks":0,"cpu_blocks":0,"ssd_blocks":0,"shared":0,"pinned":0,"waste_rate":0,"tool_wait_release_rate":0},
+                    "prefix": {"total_entries":0,"pinned_entries":0,"hot_entries":0,"hit_rate":0,"blocks_reused":0},
+                    "tiers": {"gpu_bytes":0,"cpu_bytes":0,"ssd_bytes":0,"gpu_ratio":0,"cpu_ratio":0,"total_migrations":0,"total_prefetches":0},
+                    "lifecycle": {"active_requests":0,"waiting_requests":0,"prefill_count":0,"decoding_count":0,"tool_call_count":0,"idle_count":0,"completed_count":0,"total_demotions":0,"total_promotions":0},
+                    "compression": {"total_tokens_saved":0,"total_history_compressions":0,"total_messages_dropped":0},
+                    "_waiting": True
+                })
                 return
 
             s = mgr.stats()
@@ -411,35 +421,17 @@ def main():
     parser.add_argument("--gpu-gb", type=int, default=6)
     args = parser.parse_args()
 
-    # Try to get an existing manager from agent.memory_hooks global
+    # Wait for hermes agent to connect (its kv_memory_integration sets the global)
     mgr = get_global_manager()
 
     if mgr is not None:
-        set_global_manager(mgr)
-        print(f"[monitor] Connected to agent memory manager ({mgr.allocator.total_blocks} blocks)")
-    else:
-        print("[monitor] Waiting for agent to start... (start hermes CLI in another terminal)")
-        print("  The dashboard will show data once the agent connects.")
-        print("  Refresh http://localhost:{port} after starting hermes.")
-        # Create a minimal standalone manager so the API doesn't 503
-        try:
-            from agent.memory_hooks import create_agent_memory_manager
-            mgr = create_agent_memory_manager(args.model, gpu_gb=args.gpu_gb)
-            set_global_manager(mgr)
-            print(f"[init] Created standalone manager ({mgr.allocator.total_blocks} blocks)")
-            print(f"  This is NOT connected to your hermes agent.")
-            print(f"  Start hermes AFTER starting this server to see real data.")
-        except Exception as e:
-            print(f"[warn] Could not create manager: {e}")
-
-    if mgr is not None:
-        print(f"[monitor] Connected to active memory manager")
-        print(f"  Blocks: {mgr.allocator.total_blocks}")
+        print(f"[monitor] ✅ Connected to agent memory manager ({mgr.allocator.total_blocks} blocks)")
         print(f"  Sessions: {mgr.lifecycle.stats()['total_requests']}")
     else:
-        print("[monitor] No memory manager found — API will return 503")
-        print("  Start it via: from scripts.monitor_api import set_global_manager")
-        print("  Or: python scripts/monitor_api.py --init")
+        print("[monitor] ⏳ Waiting for hermes agent...")
+        print("  Start hermes in another terminal: hermes")
+        print("  The API will start serving real data once hermes connects.")
+        print("  Dashboard will show zeros until then — refresh the page.")
 
     print(f"\n  Dashboard: http://localhost:{args.port}")
     print(f"  API:       http://localhost:{args.port}/api/snapshot")
