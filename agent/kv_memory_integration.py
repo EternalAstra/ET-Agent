@@ -14,8 +14,8 @@ logger = logging.getLogger(__name__)
 
 def _kv_config() -> dict:
     try:
-        from hermes_cli.config import get_config
-        cfg = get_config() or {}
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly() or {}
         return dict((cfg.get("memory") or {}).get("kv_manager") or {})
     except Exception:
         return {}

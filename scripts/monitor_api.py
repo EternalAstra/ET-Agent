@@ -443,36 +443,20 @@ def main():
                         help="Path to shared stats JSON (hermes writes, monitor reads)")
     args = parser.parse_args()
 
-    # Try shared-file mode first (cross-process IPC)
-    if args.shared_file:
-        print(f"[monitor] Shared-file mode: {args.shared_file}")
-        # The hermes agent writes stats via kv_memory_integration → this file
-        # The monitor reads it on each /api/snapshot
-    elif getattr(args, "no_demo", False):
-        pass  # no demo, no shared file → wait for hermes in-process (won't work cross-process)
-    else:
-        # Default: create own manager + background demo benchmark
+    # Default: always have a live manager so the dashboard shows data
+    mgr = get_global_manager()
+
+    if mgr is None:
         from agent.memory_hooks import create_agent_memory_manager
         mgr = create_agent_memory_manager(args.model, gpu_gb=args.gpu_gb)
         set_global_manager(mgr)
         print(f"[init] Created memory manager ({mgr.allocator.total_blocks} blocks)")
+
+    if not getattr(args, "no_demo", False):
         print(f"[bench] Starting demo benchmark in background...")
         _start_demo_benchmark(mgr)
 
-    # Check what we have
-    mgr = get_global_manager()
-    if mgr is not None:
-        print(f"[monitor] Ready — {mgr.allocator.total_blocks} blocks, "
-              f"{mgr.lifecycle.stats()['total_requests']} sessions")
-    else:
-        print("[monitor] Waiting for data source...")
-        # Create a minimal manager as fallback
-        try:
-            from agent.memory_hooks import create_agent_memory_manager
-            mgr = create_agent_memory_manager(args.model, gpu_gb=args.gpu_gb)
-            set_global_manager(mgr)
-        except Exception:
-            pass
+    print(f"[monitor] Ready — {mgr.allocator.total_blocks} blocks")
 
     print(f"\n  Dashboard: http://localhost:{args.port}")
     print(f"  API:       http://localhost:{args.port}/api/snapshot")
