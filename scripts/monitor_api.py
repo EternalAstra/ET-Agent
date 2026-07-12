@@ -139,22 +139,6 @@ table.features .new{color:var(--gpu);font-weight:600}
       </div>
     </div>
   </div>
-  <div class=section>
-    <div class=section-hdr>⭐ ET-Agent vs Original Hermes</div>
-    <div class=section-body>
-      <table class=features>
-        <tr><th>Feature</th><th>Original Hermes</th><th>ET-Agent</th></tr>
-        <tr><td>KV Cache Management</td><td>Contiguous (~60% waste)</td><td class=new>PagedAttention (~3.7% waste)</td></tr>
-        <tr><td>Prefix Reuse</td><td>--</td><td class=new>MoonCake hash-chain (O(1) lookup)</td></tr>
-        <tr><td>Storage Tiers</td><td>GPU only</td><td class=new>GPU → CPU → SSD hierarchical</td></tr>
-        <tr><td>Lifecycle Awareness</td><td>Stateless</td><td class=new>5-phase agent lifecycle tracker</td></tr>
-        <tr><td>Context Compression</td><td>Generic engine</td><td class=new>ACON structured (ICML 2026)</td></tr>
-        <tr><td>Tool Schema</td><td>Full schema every turn</td><td class=new>Frequency-tiered, progressive</td></tr>
-        <tr><td>Prompt Dedup</td><td>--</td><td class=new>System prompt + tool elision</td></tr>
-        <tr><td>Monitor Dashboard</td><td>--</td><td class=new>Real-time + Electron-ready</td></tr>
-      </table>
-    </div>
-  </div>
 </div>
 <script>
 const MAX=120;
@@ -237,12 +221,10 @@ def set_global_manager(mgr):
 
 
 def get_global_manager():
-    """Try to get the active manager from multiple sources."""
+    """Get the active manager — agent-created takes priority."""
     global _global_manager
-    if _global_manager is not None:
-        return _global_manager
 
-    # Try from agent.memory_hooks global
+    # Priority 1: agent.memory_hooks global (set by hermes agent init)
     try:
         from agent.memory_hooks import get_global_memory_manager
         mgr = get_global_memory_manager()
@@ -252,7 +234,11 @@ def get_global_manager():
     except Exception:
         pass
 
-    # Try from plugin module
+    # Priority 2: locally stored (set by set_global_manager)
+    if _global_manager is not None:
+        return _global_manager
+
+    # Priority 3: plugin module cached instance
     try:
         from plugins.memory_manager_plugin.__init__ import _memory_manager as _pm
         if _pm is not None:
@@ -316,11 +302,13 @@ class MonitorHandler(BaseHTTPRequestHandler):
             # We estimate: total token capacity = used_blocks * block_size
             #              actual tokens ≈ prefix entries * block_size (cached blocks are "full")
             #              internal waste = (unfilled_slots) / capacity
-            total_capacity = used * mgr._config.block_size  # token slots in all allocated blocks
+            # Waste rate: fraction of allocated block SLOTS that are empty.
+            # PagedAttention: only the last block per request is partially filled.
+            # Waste ≈ (unfilled_slots) / (total_allocated_capacity).
+            # We estimate: total entries ≈ total filled blocks, remaining = waste.
             prefix_entries = p.get("total_entries", 0)
-            # Each prefix entry maps 1 hash → ≥1 block. Assume 1:1 for waste estimation.
-            filled_blocks = min(prefix_entries, used)
-            waste_rate = round(1.0 - (filled_blocks / max(used, 1)), 4) if used > 0 else 0.0
+            filled_blocks = min(prefix_entries, max(used, 1))
+            waste_rate = round(1.0 - (filled_blocks / max(used, 1)), 4)
 
             demotions = l.get("total_demotions", 0)
             promotions = l.get("total_promotions", 0)
@@ -421,18 +409,28 @@ def main():
     parser.add_argument("--port", type=int, default=8765, help="HTTP port")
     parser.add_argument("--model", default="qwen2.5-7b")
     parser.add_argument("--gpu-gb", type=int, default=6)
-    parser.add_argument("--init", action="store_true",
-                        help="Auto-create a memory manager if none registered")
     args = parser.parse_args()
 
-    # Try to get an existing manager first
+    # Try to get an existing manager from agent.memory_hooks global
     mgr = get_global_manager()
 
-    if mgr is None and args.init:
-        from agent.memory_hooks import create_agent_memory_manager
-        mgr = create_agent_memory_manager(args.model, gpu_gb=args.gpu_gb)
+    if mgr is not None:
         set_global_manager(mgr)
-        print(f"[init] Created memory manager ({mgr.allocator.total_blocks} blocks)")
+        print(f"[monitor] Connected to agent memory manager ({mgr.allocator.total_blocks} blocks)")
+    else:
+        print("[monitor] Waiting for agent to start... (start hermes CLI in another terminal)")
+        print("  The dashboard will show data once the agent connects.")
+        print("  Refresh http://localhost:{port} after starting hermes.")
+        # Create a minimal standalone manager so the API doesn't 503
+        try:
+            from agent.memory_hooks import create_agent_memory_manager
+            mgr = create_agent_memory_manager(args.model, gpu_gb=args.gpu_gb)
+            set_global_manager(mgr)
+            print(f"[init] Created standalone manager ({mgr.allocator.total_blocks} blocks)")
+            print(f"  This is NOT connected to your hermes agent.")
+            print(f"  Start hermes AFTER starting this server to see real data.")
+        except Exception as e:
+            print(f"[warn] Could not create manager: {e}")
 
     if mgr is not None:
         print(f"[monitor] Connected to active memory manager")

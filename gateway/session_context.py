@@ -9,9 +9,9 @@ def set_current_session_id(session_id: str | None) -> None:
 def get_current_session_id() -> str | None:
     return _current_session_id.get(None)
 
-def get_session_env() -> dict:
-    """Return empty session env since gateway is not available."""
-    return {}
+def get_session_env(key: str = "") -> str:
+    """Return empty string since gateway is not available."""
+    return ""
 
 class SessionContext:
     """Minimal stub."""
