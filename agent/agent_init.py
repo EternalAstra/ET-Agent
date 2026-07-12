@@ -1755,6 +1755,14 @@ def init_agent(
             "is_anthropic_oauth": agent._is_anthropic_oauth,
         })
 
+    # ── Memory Manager initialization (ET-Agent Phase 5) ──
+    # Lazy init: the full AgentMemoryManager is heavy (~93K blocks default).
+    # Only create it when explicitly requested via enable_memory_manager=True
+    # or when the memory-manager plugin discovers and activates it.
+    # The attribute is always set so callers can check for None.
+    agent._memory_manager = None
+    agent._memory_monitor = None
+
 
 
 __all__ = ["init_agent"]

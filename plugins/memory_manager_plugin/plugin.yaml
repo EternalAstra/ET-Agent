@@ -1,0 +1,11 @@
+name: "memory-manager"
+version: "0.0.1"
+description: "ET-Agent Memory Manager — KV Cache lifecycle + context compression"
+kind: standalone
+provides_hooks:
+  - on_session_start
+  - on_session_end
+  - pre_llm_call
+  - post_llm_call
+  - pre_tool_call
+  - post_tool_call

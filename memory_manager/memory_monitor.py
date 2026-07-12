@@ -56,6 +56,9 @@ class BlockSnapshot:
     pinned: int = 0
     active_requests: int = 0
     usage_ratio: float = 0.0
+    # ── Competition metrics (computed) ──
+    waste_rate: float = 0.0              # GPU waste rate = unused_slots/total_allocated
+    tool_wait_release_rate: float = 0.0  # GPU blocks moved to CPU during tool wait / total GPU at tool start
 
     def to_chart_data(self) -> dict:
         return {
