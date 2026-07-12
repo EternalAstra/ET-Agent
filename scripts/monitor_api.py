@@ -419,19 +419,107 @@ def main():
     parser.add_argument("--port", type=int, default=8765, help="HTTP port")
     parser.add_argument("--model", default="qwen2.5-7b")
     parser.add_argument("--gpu-gb", type=int, default=6)
+    parser.add_argument("--demo", action="store_true", default=True,
+                        help="Run a demo benchmark to generate live data (default: on)")
+    parser.add_argument("--no-demo", action="store_true",
+                        help="Disable demo benchmark")
+    parser.add_argument("--shared-file", default="",
+                        help="Path to shared stats JSON (hermes writes, monitor reads)")
     args = parser.parse_args()
 
-    # Wait for hermes agent to connect (its kv_memory_integration sets the global)
-    mgr = get_global_manager()
-
-    if mgr is not None:
-        print(f"[monitor] ✅ Connected to agent memory manager ({mgr.allocator.total_blocks} blocks)")
-        print(f"  Sessions: {mgr.lifecycle.stats()['total_requests']}")
+    # Try shared-file mode first (cross-process IPC)
+    if args.shared_file:
+        print(f"[monitor] Shared-file mode: {args.shared_file}")
+        # The hermes agent writes stats via kv_memory_integration → this file
+        # The monitor reads it on each /api/snapshot
+    elif getattr(args, "no_demo", False):
+        pass  # no demo, no shared file → wait for hermes in-process (won't work cross-process)
     else:
-        print("[monitor] ⏳ Waiting for hermes agent...")
-        print("  Start hermes in another terminal: hermes")
-        print("  The API will start serving real data once hermes connects.")
-        print("  Dashboard will show zeros until then — refresh the page.")
+        # Default: create own manager + background demo benchmark
+        from agent.memory_hooks import create_agent_memory_manager
+        mgr = create_agent_memory_manager(args.model, gpu_gb=args.gpu_gb)
+        set_global_manager(mgr)
+        print(f"[init] Created memory manager ({mgr.allocator.total_blocks} blocks)")
+        print(f"[bench] Starting demo benchmark in background...")
+        _start_demo_benchmark(mgr)
+
+    # Check what we have
+    mgr = get_global_manager()
+    if mgr is not None:
+        print(f"[monitor] Ready — {mgr.allocator.total_blocks} blocks, "
+              f"{mgr.lifecycle.stats()['total_requests']} sessions")
+    else:
+        print("[monitor] Waiting for data source...")
+        # Create a minimal manager as fallback
+        try:
+            from agent.memory_hooks import create_agent_memory_manager
+            mgr = create_agent_memory_manager(args.model, gpu_gb=args.gpu_gb)
+            set_global_manager(mgr)
+        except Exception:
+            pass
+
+    print(f"\n  Dashboard: http://localhost:{args.port}")
+    print(f"  API:       http://localhost:{args.port}/api/snapshot")
+    print()
+
+    start_monitor_api(port=args.port, blocking=True)
+
+
+def _start_demo_benchmark(mgr):
+    """Background thread: simulate 3 agent sessions with tool calls, phase transitions, migrations."""
+    import random, threading
+
+    def _run():
+        try:
+            sids = ["sess-a", "sess-b", "sess-c"]
+            for sid in sids:
+                sp = [random.randint(0, 50000) for _ in range(3000)]
+                tools = [{"type": "function", "function": {"name": n, "description": n,
+                         "parameters": {"type": "object", "properties": {}}}}
+                         for n in ["search", "read", "write", "terminal"]]
+                mgr.on_session_start(sid, system_prompt_tokens=sp, tool_definitions=tools)
+
+            for turn in range(500):
+                for sid in sids:
+                    msgs = [{"role": "user", "content": f"Turn {turn}: " + "x" * random.randint(20, 200)}]
+                    mgr.pre_llm_call(sid, msgs)
+                    r = random.random()
+                    if r < 0.4:
+                        mgr.post_llm_call(sid, assistant_message={
+                            "tool_calls": [{"function": {"name": random.choice(["search", "read", "write", "terminal"]),
+                                                         "arguments": "{}"}}]
+                        }, has_tool_calls=True)
+                        # Simulate tool wait → result → promote
+                        if random.random() < 0.7:
+                            mgr.hierarchical_store.demote_blocks(
+                                list(mgr.allocator.get_request_blocks(sid)),
+                                __import__('memory_manager.kv_block', fromlist=['StorageTier']).StorageTier.CPU, sid
+                            )
+                        mgr.on_tool_result(sid, tool_name="search")
+                    else:
+                        mgr.post_llm_call(sid, has_tool_calls=False)
+
+                # Periodic compression
+                if turn % 20 == 0 and turn > 0:
+                    for sid in sids:
+                        total = turn * 600
+                        mgr.maybe_compress(sid, msgs, total, 50000)
+
+                # Periodic lifecycle scan → demotions
+                if turn % 8 == 0:
+                    mgr.lifecycle.scan_and_migrate()
+                    mgr.hierarchical_store.evict_cold_blocks()
+
+                time.sleep(0.25)
+
+            for sid in sids:
+                mgr.on_session_end(sid)
+        except Exception:
+            import traceback; traceback.print_exc()
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    return t
 
     print(f"\n  Dashboard: http://localhost:{args.port}")
     print(f"  API:       http://localhost:{args.port}/api/snapshot")
