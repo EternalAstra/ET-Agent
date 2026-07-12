@@ -44,12 +44,23 @@ def init_kv_memory_manager(agent: Any) -> None:
         try:
             from scripts.monitor_api import start_monitor_api, set_global_manager
             set_global_manager(mgr)
-            import threading
+            import threading, socket
             _mon_port = int(kv_cfg.get("monitor_port", 8765))
-            threading.Thread(
-                target=lambda: start_monitor_api(port=_mon_port, blocking=True),
-                daemon=True, name="et-agent-monitor",
-            ).start()
+
+            # Check port is free
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            in_use = sock.connect_ex(('127.0.0.1', _mon_port)) == 0
+            sock.close()
+            if in_use:
+                logger.warning("Monitor port %d already in use — dashboard skipped", _mon_port)
+            else:
+                def _run_monitor():
+                    start_monitor_api(port=_mon_port, blocking=True)
+                t = threading.Thread(target=_run_monitor, daemon=True, name="et-agent-monitor")
+                t.start()
+                # Print a visible message so user knows dashboard is ready
+                print(f"\n  📊 Memory Monitor: http://localhost:{_mon_port}\n")
+                logger.info("Memory monitor dashboard: http://localhost:%d", _mon_port)
         except Exception:
             pass
 
