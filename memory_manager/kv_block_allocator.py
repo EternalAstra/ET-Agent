@@ -58,23 +58,38 @@ class KVBlockAllocator:
         self._config = config
         self._block_size = config.block_size
         self._use_cuda = config.use_cuda and torch.cuda.is_available()
-        self._device = "cuda:0" if self._use_cuda else "cpu"
+        self._gpu_device = "cuda:0" if self._use_cuda else "cpu"
+        self._cpu_device = "cpu"
         self._dtype = torch.float16 if self._use_cuda else torch.float32
         self._tensor_shape = config.kv_tensor_shape  # (L, 2, Hkv, BS, D)
         self._lock = threading.RLock()
 
-        # ── block pool ──
-        max_blocks = config.max_gpu_blocks
+        # ── GPU block pool (HBM) ──
+        n_gpu = config.max_gpu_blocks
         self._blocks: Dict[int, KVBlock] = {
-            i: KVBlock(block_id=i) for i in range(max_blocks)
+            i: KVBlock(block_id=i) for i in range(n_gpu)
         }
-        self._free_blocks: Set[int] = set(range(max_blocks))
+        self._free_blocks: Set[int] = set(range(n_gpu))
+        self._gpu_capacity: int = n_gpu
+
+        # ── CPU block pool (DRAM) ──
+        n_cpu = config.max_cpu_blocks
+        cpu_start = n_gpu
+        for i in range(cpu_start, cpu_start + n_cpu):
+            blk = KVBlock(block_id=i)
+            blk.storage_tier = StorageTier.CPU
+            self._blocks[i] = blk
+        self._free_cpu_blocks: Set[int] = set(range(cpu_start, cpu_start + n_cpu))
+        self._cpu_capacity: int = n_cpu
+        self._cpu_start: int = cpu_start
 
         # ── clock ──
         self._clock = time.monotonic
 
         # ── per-request tracking ──
         self._request_blocks: Dict[str, Set[int]] = {}
+        # ── which requests have blocks swapped to CPU ──
+        self._swapped_requests: Set[str] = set()
 
         # ── pinned blocks ──
         self._pinned_blocks: Dict[str, Set[int]] = {}
@@ -83,6 +98,8 @@ class KVBlockAllocator:
         self._total_allocations: int = 0
         self._total_frees: int = 0
         self._total_cow_clones: int = 0
+        self._total_swaps_out: int = 0
+        self._total_swaps_in: int = 0
 
     # ------------------------------------------------------------------
     # Public API — real cudaMalloc / cudaFree
@@ -116,7 +133,7 @@ class KVBlockAllocator:
                 # ── REAL CUDA ALLOCATION ──
                 if self._use_cuda and block._tensor is None:
                     block.allocate_tensor(
-                        self._tensor_shape, device=self._device, dtype=self._dtype
+                        self._tensor_shape, device=self._gpu_device, dtype=self._dtype
                     )
 
                 allocated.append(bid)
@@ -145,7 +162,7 @@ class KVBlockAllocator:
 
                 if self._use_cuda and block._tensor is None:
                     block.allocate_tensor(
-                        self._tensor_shape, device=self._device, dtype=self._dtype
+                        self._tensor_shape, device=self._gpu_device, dtype=self._dtype
                     )
 
                 allocated.append(bid)
@@ -203,7 +220,7 @@ class KVBlockAllocator:
             # Allocate tensor
             if self._use_cuda:
                 new_block.allocate_tensor(
-                    self._tensor_shape, device=self._device, dtype=self._dtype
+                    self._tensor_shape, device=self._gpu_device, dtype=self._dtype
                 )
                 # REAL GPU memcpy via torch.clone()
                 if old_block._tensor is not None:
@@ -230,6 +247,140 @@ class KVBlockAllocator:
     def touch_block(self, physical_id: int):
         with self._lock:
             self._get_block(physical_id).touch(self._clock())
+
+    # ------------------------------------------------------------------
+    # REAL GPU ↔ CPU swap (torch.copy_ cudaMemcpy, NOT metadata-only)
+    # ------------------------------------------------------------------
+
+    def swap_out(self, request_id: str, gpu_block_ids: List[int]) -> List[int]:
+        """vLLM-style real swap-out: GPU→CPU memcpy.
+
+        Allocates CPU blocks in DRAM, copies GPU tensor data to them via
+        ``cpu_tensor.copy_(gpu_tensor)``, then frees the GPU blocks.
+
+        Returns the CPU block IDs that now hold the data.
+        """
+        with self._lock:
+            if len(self._free_cpu_blocks) < len(gpu_block_ids):
+                raise OutOfMemoryError(
+                    requested=len(gpu_block_ids),
+                    available=len(self._free_cpu_blocks),
+                    tier=StorageTier.CPU,
+                )
+
+            cpu_ids: List[int] = []
+            ts = self._clock()
+
+            for gpu_bid in gpu_block_ids:
+                gpu_blk = self._get_block(gpu_bid)
+                if gpu_blk._tensor is None:
+                    continue
+
+                cpu_bid = self._free_cpu_blocks.pop()
+                cpu_blk = self._blocks[cpu_bid]
+                cpu_blk.allocate_tensor(
+                    self._tensor_shape, device=self._cpu_device, dtype=self._dtype,
+                )
+
+                # REAL GPU→CPU memcpy
+                cpu_blk._tensor.copy_(gpu_blk._tensor)
+
+                cpu_blk.num_tokens = gpu_blk.num_tokens
+                cpu_blk.group_id = gpu_blk.group_id
+                cpu_blk.storage_tier = StorageTier.CPU
+                cpu_blk.state = KVBlockState.ALLOCATED
+                cpu_blk.ref_count = 1
+                cpu_blk.touch(ts)
+
+                gpu_blk.decrement_ref()
+                self._add_to_free(gpu_bid)
+                self._request_blocks.setdefault(request_id, set()).add(cpu_bid)
+                cpu_ids.append(cpu_bid)
+
+            self._swapped_requests.add(request_id)
+            self._total_swaps_out += 1
+            return cpu_ids
+
+    def swap_in(self, request_id: str, cpu_block_ids: List[int]) -> List[int]:
+        """vLLM-style real swap-in: CPU→GPU memcpy.
+
+        Allocates GPU blocks, copies CPU data back, frees CPU blocks.
+        """
+        with self._lock:
+            if len(self._free_blocks) < len(cpu_block_ids):
+                raise OutOfMemoryError(
+                    requested=len(cpu_block_ids),
+                    available=len(self._free_blocks),
+                )
+
+            gpu_ids: List[int] = []
+            ts = self._clock()
+
+            for cpu_bid in cpu_block_ids:
+                cpu_blk = self._get_block(cpu_bid)
+                if cpu_blk._tensor is None:
+                    continue
+
+                gpu_bid = self._free_blocks.pop()
+                gpu_blk = self._blocks[gpu_bid]
+                gpu_blk.allocate_tensor(
+                    self._tensor_shape, device=self._gpu_device, dtype=self._dtype,
+                )
+
+                # REAL CPU→GPU memcpy
+                gpu_blk._tensor.copy_(cpu_blk._tensor)
+
+                gpu_blk.num_tokens = cpu_blk.num_tokens
+                gpu_blk.group_id = cpu_blk.group_id
+                gpu_blk.storage_tier = StorageTier.GPU
+                gpu_blk.state = KVBlockState.ALLOCATED
+                gpu_blk.ref_count = 1
+                gpu_blk.touch(ts)
+
+                cpu_blk.decrement_ref()
+                self._add_to_cpu_free(cpu_bid)
+                self._request_blocks.setdefault(request_id, set()).add(gpu_bid)
+                if request_id in self._request_blocks:
+                    self._request_blocks[request_id].discard(cpu_bid)
+                gpu_ids.append(gpu_bid)
+
+            if request_id in self._request_blocks and not any(
+                b >= self._cpu_start for b in self._request_blocks[request_id]
+            ):
+                self._swapped_requests.discard(request_id)
+
+            self._total_swaps_in += 1
+            return gpu_ids
+
+    @property
+    def is_swapped(self, request_id: str) -> bool:
+        return request_id in self._swapped_requests
+
+    # ── CPU pool queries ──
+
+    @property
+    def free_cpu_blocks_count(self) -> int:
+        with self._lock:
+            return len(self._free_cpu_blocks)
+
+    @property
+    def used_cpu_blocks_count(self) -> int:
+        return self._cpu_capacity - self.free_cpu_blocks_count
+
+    @property
+    def cpu_bytes_used(self) -> int:
+        with self._lock:
+            return sum(
+                b.tensor_bytes for bid in range(self._cpu_start, self._cpu_start + self._cpu_capacity)
+                if (b := self._blocks.get(bid)) and not b.is_free
+            )
+
+    def get_cpu_block_ids(self, request_id: str) -> List[int]:
+        with self._lock:
+            return sorted(
+                bid for bid in self._request_blocks.get(request_id, set())
+                if bid >= self._cpu_start
+            )
 
     # ------------------------------------------------------------------
     # Pinned blocks
@@ -262,7 +413,16 @@ class KVBlockAllocator:
 
     @property
     def total_blocks(self) -> int:
-        return len(self._blocks)
+        """Total GPU blocks (backward compat)."""
+        return self._gpu_capacity
+
+    @property
+    def total_gpu_blocks(self) -> int:
+        return self._gpu_capacity
+
+    @property
+    def total_cpu_blocks(self) -> int:
+        return self._cpu_capacity
 
     @property
     def free_blocks(self) -> int:
@@ -271,7 +431,7 @@ class KVBlockAllocator:
 
     @property
     def used_blocks(self) -> int:
-        return self.total_blocks - self.free_blocks
+        return self.total_gpu_blocks - self.free_blocks
 
     @property
     def shared_blocks(self) -> int:
@@ -285,7 +445,7 @@ class KVBlockAllocator:
 
     @property
     def usage_ratio(self) -> float:
-        return self.used_blocks / max(self.total_blocks, 1)
+        return self.used_blocks / max(self.total_gpu_blocks, 1)
 
     # ── REAL GPU memory reported via torch.cuda ──
 
@@ -334,20 +494,32 @@ class KVBlockAllocator:
             } if self._use_cuda else {}
 
             return {
-                "total_blocks": self.total_blocks,
+                # GPU pool (backward compat keys)
+                "total_blocks": self.total_gpu_blocks,
                 "free_blocks": len(self._free_blocks),
-                "used_blocks": self.total_blocks - len(self._free_blocks),
+                "used_blocks": self.total_gpu_blocks - len(self._free_blocks),
+                # CPU pool
+                "total_blocks_cpu": self.total_cpu_blocks,
+                "free_blocks_cpu": len(self._free_cpu_blocks),
+                "used_blocks_cpu": self.total_cpu_blocks - len(self._free_cpu_blocks),
+                # Explicit pool names
+                "total_blocks_gpu": self.total_gpu_blocks,
+                "free_blocks_gpu": len(self._free_blocks),
+                "used_blocks_gpu": self.total_gpu_blocks - len(self._free_blocks),
                 "shared_blocks": self.shared_blocks,
                 "pinned_blocks": self.pinned_blocks,
+                "swapped_requests": len(self._swapped_requests),
                 "active_requests": len(self._request_blocks),
                 "total_allocations": self._total_allocations,
                 "total_frees": self._total_frees,
                 "total_cow_clones": self._total_cow_clones,
+                "total_swaps_out": self._total_swaps_out,
+                "total_swaps_in": self._total_swaps_in,
                 "usage_ratio": round(self.usage_ratio, 4),
                 "block_size": self._block_size,
                 "block_tensor_bytes": self._config.block_size_bytes,
                 "use_cuda": self._use_cuda,
-                "device": self._device if self._use_cuda else "cpu",
+                "device": self._gpu_device if self._use_cuda else "cpu",
                 **gpu_mem,
             }
 
@@ -368,7 +540,14 @@ class KVBlockAllocator:
 
     def _add_to_free(self, physical_id: int):
         self._blocks[physical_id].mark_free()
-        self._free_blocks.add(physical_id)
+        if physical_id < self._cpu_start:
+            self._free_blocks.add(physical_id)
+        else:
+            self._free_cpu_blocks.add(physical_id)
+
+    def _add_to_cpu_free(self, physical_id: int):
+        self._blocks[physical_id].mark_free()
+        self._free_cpu_blocks.add(physical_id)
 
     def _release_block(self, physical_id: int) -> bool:
         block = self._blocks[physical_id]
