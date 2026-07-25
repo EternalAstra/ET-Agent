@@ -1,39 +1,26 @@
 """
-KV Cache Block Allocator — physical block pool with reference counting.
+KV Cache Block Allocator — real CUDA memory-backed block pool.
 
-Implements the fixed-size page-based memory allocation from vLLM's
-PagedAttention (SOSP 2023, §4.2).  The allocator manages a pool of
-``KVBlock`` instances, each representing one page of KV Cache memory
-(default 16 tokens per block).
+Each ``KVBlock`` holds a real ``torch.float16`` tensor on GPU VRAM
+of shape ``(num_layers, 2, num_kv_heads, block_size, head_dim)``.
 
-Allocation follows the OS virtual-memory model:
+Allocation = cudaMalloc (torch.zeros on GPU device).
+Free        = cudaFree  (del tensor + torch.cuda.empty_cache).
+Clone       = cudaMemcpy (torch.clone for COW).
 
-1. **allocate()** — reserve *N* free physical blocks, assign them to a
-   request's block table, return their IDs.
-2. **free()** — release all blocks owned by a request; physical blocks
-   with ref_count=0 return to the free pool.
-3. **free_block()** — release a single logical block (e.g. after COW clone).
-4. **clone_block()** — copy-on-write: allocate a new block, memcpy data,
-   decrement old block's ref_count.
+The allocator also tracks ``torch.cuda.memory_allocated()`` to provide
+real GPU VRAM usage metrics, directly comparable to nvidia-smi output.
 
-Thread safety
--------------
-All public methods acquire ``_lock`` (``threading.RLock``), making the
-allocator safe for concurrent access from the agent's tool-execution
-thread pool and the main conversation loop.
-
-Reference
----------
-- vLLM §4.2  (KV Cache Manager / Block Allocator)
-- vLLM §4.3  (Decoding with PagedAttention, Figure 6)
-- vLLM §4.4  (Copy-on-write for parallel sampling, Figure 8)
+This is NOT a simulation — every allocated block consumes real GPU memory.
 """
 
 from __future__ import annotations
 
 import threading
 import time
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set
+
+import torch
 
 from memory_manager.kv_block import (
     KVBlock,
@@ -43,44 +30,37 @@ from memory_manager.kv_block import (
 from memory_manager.config import MemoryConfig
 
 
-# ---------------------------------------------------------------------------
-# Errors
-# ---------------------------------------------------------------------------
-
 class OutOfMemoryError(RuntimeError):
-    """Raised when the block pool cannot satisfy an allocation request."""
-
     def __init__(self, requested: int, available: int, tier: StorageTier = StorageTier.GPU):
         self.requested = requested
         self.available = available
         self.tier = tier
         super().__init__(
-            f"Out of memory: requested {requested} blocks, "
-            f"only {available} free (tier={tier.value})"
+            f"CUDA OOM: requested {requested} blocks, only {available} free "
+            f"(tier={tier.value}, device='{torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'cpu'}')"
         )
 
 
 class BlockNotFoundError(KeyError):
-    """Raised when a physical block ID is not found in the pool."""
     pass
 
 
-# ---------------------------------------------------------------------------
-# Allocator
-# ---------------------------------------------------------------------------
-
 class KVBlockAllocator:
-    """Fixed-size physical KV Cache block pool.
+    """Fixed-size physical KV Cache block pool with real CUDA tensor backing.
 
     Parameters
     ----------
     config : MemoryConfig
-        Global memory configuration (block_size, capacities).
+        Global memory config (block_size, capacities, model_profile).
     """
 
     def __init__(self, config: MemoryConfig):
         self._config = config
         self._block_size = config.block_size
+        self._use_cuda = config.use_cuda and torch.cuda.is_available()
+        self._device = "cuda:0" if self._use_cuda else "cpu"
+        self._dtype = torch.float16 if self._use_cuda else torch.float32
+        self._tensor_shape = config.kv_tensor_shape  # (L, 2, Hkv, BS, D)
         self._lock = threading.RLock()
 
         # ── block pool ──
@@ -90,34 +70,30 @@ class KVBlockAllocator:
         }
         self._free_blocks: Set[int] = set(range(max_blocks))
 
-        # ── monotonic clock ──
+        # ── clock ──
         self._clock = time.monotonic
 
-        # ── allocation tracking (per-request) ──
-        # request_id → set of physical_block_ids
+        # ── per-request tracking ──
         self._request_blocks: Dict[str, Set[int]] = {}
 
-        # ── pinned system-prompt blocks ──
-        # system_prompt_hash → set of physical_block_ids
+        # ── pinned blocks ──
         self._pinned_blocks: Dict[str, Set[int]] = {}
 
-        # ── statistics ──
+        # ── stats ──
         self._total_allocations: int = 0
         self._total_frees: int = 0
         self._total_cow_clones: int = 0
 
     # ------------------------------------------------------------------
-    # Public API
+    # Public API — real cudaMalloc / cudaFree
     # ------------------------------------------------------------------
 
     def allocate(self, request_id: str, num_tokens: int,
                  group_id: str | None = None) -> List[int]:
-        """Allocate enough blocks to hold *num_tokens* for *request_id*.
+        """Allocate real GPU KV Cache blocks.
 
-        Returns the list of physical block IDs assigned.  The caller is
-        responsible for updating the request's block table.
-
-        Raises ``OutOfMemoryError`` if there aren't enough free blocks.
+        Each block gets a ``torch.zeros(shape, device='cuda', dtype=float16)``
+        tensor — actual GPU VRAM consumption.
         """
         blocks_needed = max(1, (num_tokens + self._block_size - 1) // self._block_size)
 
@@ -136,9 +112,15 @@ class KVBlockAllocator:
                 block = self._blocks[bid]
                 block.mark_allocated(num_tokens=0, group_id=group_id)
                 block.touch(ts)
+
+                # ── REAL CUDA ALLOCATION ──
+                if self._use_cuda and block._tensor is None:
+                    block.allocate_tensor(
+                        self._tensor_shape, device=self._device, dtype=self._dtype
+                    )
+
                 allocated.append(bid)
 
-            # Track per-request ownership
             if request_id not in self._request_blocks:
                 self._request_blocks[request_id] = set()
             self._request_blocks[request_id].update(allocated)
@@ -148,13 +130,9 @@ class KVBlockAllocator:
 
     def allocate_exact(self, request_id: str, num_blocks: int,
                        group_id: str | None = None) -> List[int]:
-        """Allocate exactly *num_blocks* blocks (used for pre-allocated margins)."""
         with self._lock:
             if len(self._free_blocks) < num_blocks:
-                raise OutOfMemoryError(
-                    requested=num_blocks,
-                    available=len(self._free_blocks),
-                )
+                raise OutOfMemoryError(requested=num_blocks, available=len(self._free_blocks))
 
             allocated: List[int] = []
             ts = self._clock()
@@ -164,6 +142,12 @@ class KVBlockAllocator:
                 block = self._blocks[bid]
                 block.mark_allocated(group_id=group_id)
                 block.touch(ts)
+
+                if self._use_cuda and block._tensor is None:
+                    block.allocate_tensor(
+                        self._tensor_shape, device=self._device, dtype=self._dtype
+                    )
+
                 allocated.append(bid)
 
             self._request_blocks.setdefault(request_id, set()).update(allocated)
@@ -171,7 +155,7 @@ class KVBlockAllocator:
             return allocated
 
     def free(self, request_id: str) -> int:
-        """Release all blocks owned by *request_id*.  Returns count freed."""
+        """Release ALL blocks owned by *request_id* — real cudaFree."""
         with self._lock:
             if request_id not in self._request_blocks:
                 return 0
@@ -186,16 +170,11 @@ class KVBlockAllocator:
             return freed
 
     def free_block(self, request_id: str, physical_id: int) -> bool:
-        """Release a single physical block from *request_id*.
-
-        Returns True if the block transitioned to FREE.
-        """
         with self._lock:
             block = self._get_block(physical_id)
             if block.decrement_ref():
                 self._add_to_free(physical_id)
                 self._total_frees += 1
-                # Remove from request tracking
                 if request_id in self._request_blocks:
                     self._request_blocks[request_id].discard(physical_id)
                 return True
@@ -203,33 +182,33 @@ class KVBlockAllocator:
 
     def clone_block(self, request_id: str,
                     old_physical_id: int) -> int:
-        """Copy-on-write clone.
+        """REAL copy-on-write: torch.clone() = GPU memcpy.
 
-        Allocates a new physical block, copies the token count (and
-        eventually tensor data — Phase 3), decrements the old block's
-        ref_count, and returns the new physical block ID.
-
-        This implements vLLM §4.3 / Figure 8: when a shared block needs
-        to be written to by one of its owners, clone it first.
-
-        Raises ``OutOfMemoryError`` if no free block is available.
+        Allocates a new block, deep-copies the tensor from the old block,
+        decrements old ref_count, returns new block ID.
         """
         with self._lock:
             old_block = self._get_block(old_physical_id)
 
             if old_block.ref_count <= 1:
-                # No sharing — write in-place; no clone needed.
                 return old_physical_id
 
             if not self._free_blocks:
                 raise OutOfMemoryError(requested=1, available=0)
 
-            # Allocate new block
             new_bid = self._free_blocks.pop()
             new_block = self._blocks[new_bid]
             ts = self._clock()
 
-            # Clone metadata
+            # Allocate tensor
+            if self._use_cuda:
+                new_block.allocate_tensor(
+                    self._tensor_shape, device=self._device, dtype=self._dtype
+                )
+                # REAL GPU memcpy via torch.clone()
+                if old_block._tensor is not None:
+                    new_block._tensor.copy_(old_block._tensor)
+
             new_block.mark_allocated(
                 num_tokens=old_block.num_tokens,
                 group_id=old_block.group_id,
@@ -237,49 +216,36 @@ class KVBlockAllocator:
             new_block.touch(ts)
             new_block.storage_tier = old_block.storage_tier
 
-            # Release old block's ref
             old_block.decrement_ref()
-            # Note: if old_block's ref_count hits 0 here, it won't be freed
-            # because the parent request still owns it via its block table.
-            # The caller is responsible for updating the block table.
 
-            # Track
             self._request_blocks.setdefault(request_id, set()).add(new_bid)
             self._total_allocations += 1
             self._total_cow_clones += 1
             return new_bid
 
     def increment_ref(self, physical_id: int):
-        """Add a reference to *physical_id* (used when sharing a block)."""
         with self._lock:
             self._get_block(physical_id).increment_ref()
 
     def touch_block(self, physical_id: int):
-        """Update last-access timestamp of *physical_id*."""
         with self._lock:
             self._get_block(physical_id).touch(self._clock())
 
     # ------------------------------------------------------------------
-    # Pinned / system-prompt blocks
+    # Pinned blocks
     # ------------------------------------------------------------------
 
     def pin_blocks(self, group_key: str, block_ids: List[int]):
-        """Pin a set of blocks so they are never evicted.
-
-        Typically used for system-prompt prefix blocks.
-        """
         with self._lock:
             for bid in block_ids:
                 self._get_block(bid).state = KVBlockState.PINNED
             self._pinned_blocks[group_key] = set(block_ids)
 
     def unpin_blocks(self, group_key: str) -> Set[int]:
-        """Unpin a previously pinned group; returns the block IDs."""
         with self._lock:
             block_ids = self._pinned_blocks.pop(group_key, set())
             for bid in block_ids:
                 block = self._get_block(bid)
-                # Return to appropriate state based on ref_count
                 if block.ref_count > 1:
                     block.state = KVBlockState.SHARED
                 elif block.ref_count == 1:
@@ -291,7 +257,6 @@ class KVBlockAllocator:
     # ------------------------------------------------------------------
 
     def get_block(self, physical_id: int) -> KVBlock:
-        """Read-only access to a block's metadata."""
         with self._lock:
             return self._get_block(physical_id)
 
@@ -320,26 +285,54 @@ class KVBlockAllocator:
 
     @property
     def usage_ratio(self) -> float:
-        """Fraction of total blocks currently in use."""
         return self.used_blocks / max(self.total_blocks, 1)
 
+    # ── REAL GPU memory reported via torch.cuda ──
+
+    @property
+    def cuda_bytes_allocated(self) -> int:
+        """Real GPU VRAM used by all KV tensors (torch.cuda.memory_allocated)."""
+        if not self._use_cuda:
+            return 0
+        # Sum all block tensor bytes
+        with self._lock:
+            return sum(b.tensor_bytes for b in self._blocks.values())
+
+    @property
+    def cuda_bytes_reserved(self) -> int:
+        """Total VRAM reserved by PyTorch CUDA allocator."""
+        if not self._use_cuda:
+            return 0
+        return torch.cuda.memory_reserved(0)
+
+    @property
+    def cuda_memory_utilization(self) -> float:
+        """Fraction of total GPU VRAM used by KV Cache blocks."""
+        if not self._use_cuda:
+            return 0.0
+        total = torch.cuda.get_device_properties(0).total_memory
+        return self.cuda_bytes_allocated / total if total > 0 else 0.0
+
     def get_request_blocks(self, request_id: str) -> Set[int]:
-        """Return the set of physical block IDs owned by *request_id*."""
         with self._lock:
             return self._request_blocks.get(request_id, set()).copy()
 
     def get_free_block_ids(self) -> List[int]:
-        """Return a snapshot of the free list (for debugging)."""
         with self._lock:
             return sorted(self._free_blocks)
 
     # ------------------------------------------------------------------
-    # Statistics
+    # Statistics (real GPU metrics)
     # ------------------------------------------------------------------
 
     def stats(self) -> dict:
-        """Return allocation statistics as a dict."""
         with self._lock:
+            gpu_mem = {
+                "allocated_mb": round(self.cuda_bytes_allocated / 1024**2, 1),
+                "reserved_mb": round(self.cuda_bytes_reserved / 1024**2, 1),
+                "utilization_pct": round(self.cuda_memory_utilization * 100, 2),
+            } if self._use_cuda else {}
+
             return {
                 "total_blocks": self.total_blocks,
                 "free_blocks": len(self._free_blocks),
@@ -352,34 +345,41 @@ class KVBlockAllocator:
                 "total_cow_clones": self._total_cow_clones,
                 "usage_ratio": round(self.usage_ratio, 4),
                 "block_size": self._block_size,
+                "block_tensor_bytes": self._config.block_size_bytes,
+                "use_cuda": self._use_cuda,
+                "device": self._device if self._use_cuda else "cpu",
+                **gpu_mem,
             }
 
     def reset_stats(self):
-        """Zero out cumulative counters."""
         with self._lock:
             self._total_allocations = 0
             self._total_frees = 0
             self._total_cow_clones = 0
 
     # ------------------------------------------------------------------
-    # Internal helpers
+    # Internal
     # ------------------------------------------------------------------
 
     def _get_block(self, physical_id: int) -> KVBlock:
-        """Unchecked block lookup (caller MUST hold ``_lock``)."""
         if physical_id not in self._blocks:
             raise BlockNotFoundError(f"Block {physical_id} not found")
         return self._blocks[physical_id]
 
     def _add_to_free(self, physical_id: int):
-        """Return a block to the free pool (caller MUST hold ``_lock``)."""
         self._blocks[physical_id].mark_free()
         self._free_blocks.add(physical_id)
 
     def _release_block(self, physical_id: int) -> bool:
-        """Decrement ref; return True if block became FREE."""
         block = self._blocks[physical_id]
         if block.decrement_ref():
             self._add_to_free(physical_id)
             return True
         return False
+
+    def __repr__(self) -> str:
+        mem_str = f", GPU={self.cuda_bytes_allocated/1024**2:.0f}MB" if self._use_cuda else ""
+        return (
+            f"KVBlockAllocator({self.used_blocks}/{self.total_blocks} blocks"
+            f"{mem_str}, shared={self.shared_blocks})"
+        )

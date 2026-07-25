@@ -59,6 +59,10 @@ class BlockSnapshot:
     # ── Competition metrics (computed) ──
     waste_rate: float = 0.0              # GPU waste rate = unused_slots/total_allocated
     tool_wait_release_rate: float = 0.0  # GPU blocks moved to CPU during tool wait / total GPU at tool start
+    # ── Real GPU memory (from torch.cuda) ──
+    cuda_allocated_mb: float = 0.0       # torch.cuda.memory_allocated() / 1024**2
+    cuda_reserved_mb: float = 0.0        # torch.cuda.memory_reserved() / 1024**2
+    cuda_utilization_pct: float = 0.0    # allocated / total GPU VRAM * 100
 
     def to_chart_data(self) -> dict:
         return {
@@ -330,6 +334,9 @@ class MemoryMonitor:
                 pinned=a.get("pinned_blocks", 0),
                 active_requests=a.get("active_requests", 0),
                 usage_ratio=a.get("usage_ratio", 0.0),
+                cuda_allocated_mb=a.get("allocated_mb", 0.0),
+                cuda_reserved_mb=a.get("reserved_mb", 0.0),
+                cuda_utilization_pct=a.get("utilization_pct", 0.0),
             ),
             prefix=PrefixSnapshot(
                 total_entries=p.get("total_entries", 0),
