@@ -346,6 +346,13 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     except Exception as exc:
         logger.warning("on_session_start hook failed: %s", exc)
 
+    # ── ET-Agent Phase 5: KV Cache memory manager session init ──
+    try:
+        from agent.kv_memory_integration import on_session_start_kv
+        on_session_start_kv(agent, system_prompt=agent._cached_system_prompt or "")
+    except Exception as exc:
+        logger.debug("KV memory on_session_start failed: %s", exc)
+
     # Cold-start credits seed (L3) — fallback for the first-turn path. The TUI/
     # desktop build seeds at session OPEN (see seed_credits_at_session_start in
     # tui_gateway), so this call is usually a no-op there (idempotent: skips when
@@ -880,6 +887,13 @@ def run_conversation(
         # Thinking spinner for quiet mode (animated during API call)
         thinking_spinner = None
         
+        # ── ET-Agent KV memory: pre-LLM call hook ──
+        try:
+            from agent.kv_memory_integration import pre_llm_call_kv
+            pre_llm_call_kv(agent, messages)
+        except Exception as exc:
+            logger.debug("KV pre_llm_call failed: %s", exc)
+
         if not agent.quiet_mode:
             agent._vprint(f"\n{agent.log_prefix}🔄 Making API call #{api_call_count}/{agent.max_iterations}...")
             agent._vprint(f"{agent.log_prefix}   📊 Request size: {len(api_messages)} messages, ~{approx_tokens:,} tokens (~{total_chars:,} chars)")
@@ -3593,6 +3607,17 @@ def run_conversation(
             except Exception:
                 pass
 
+        # ── ET-Agent KV memory: post-LLM call hook ──
+        try:
+            from agent.kv_memory_integration import post_llm_call_kv
+            post_llm_call_kv(
+                agent,
+                assistant_message,
+                has_tool_calls=bool(getattr(assistant_message, "tool_calls", None)),
+            )
+        except Exception as exc:
+            logger.debug("KV post_llm_call failed: %s", exc)
+
             # Handle assistant response
             if assistant_message.content and not agent.quiet_mode:
                 if agent.verbose_logging:
@@ -3970,6 +3995,17 @@ def run_conversation(
                         pass
 
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+
+                # ── ET-Agent KV memory: tool results arrived, promote blocks ──
+                try:
+                    from agent.kv_memory_integration import on_tool_results_kv
+                    _tc_names = [
+                        tc.function.name
+                        for tc in (assistant_message.tool_calls or [])
+                    ]
+                    on_tool_results_kv(agent, _tc_names or None)
+                except Exception as exc:
+                    logger.debug("KV on_tool_result failed: %s", exc)
 
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision
