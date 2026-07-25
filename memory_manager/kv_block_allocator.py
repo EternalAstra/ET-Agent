@@ -16,6 +16,7 @@ This is NOT a simulation — every allocated block consumes real GPU memory.
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from typing import Dict, List, Optional, Set
@@ -83,6 +84,21 @@ class KVBlockAllocator:
         self._cpu_capacity: int = n_cpu
         self._cpu_start: int = cpu_start
 
+        # ── SSD block pool (NVMe Flash, HiFC §3.2) ──
+        # Sparse pool: SSD blocks are allocated on demand via incrementing ID
+        # to avoid 2.4M Python objects on init.  The backing files live under
+        # ~/.et-agent/ssd_cache/ and each write is a sequential block append.
+        self._ssd_capacity: int = 2_000_000  # max SSD blocks (HiFC: large capacity)
+        self._ssd_start: int = n_cpu  # SSD block IDs start right after CPU
+        self._ssd_next_id: int = n_cpu  # next SSD block ID to assign
+        self._free_ssd_blocks: Set[int] = set()  # recycled SSD block IDs
+        self._used_ssd_block_ids: Set[int] = set()  # currently in-use SSD block IDs
+        self._ssd_block_to_file: Dict[int, str] = {}  # block_id → file path
+
+        # ── SSD cache directory ──
+        self._ssd_cache_dir = os.path.join(os.path.expanduser("~"), ".et-agent", "ssd_cache")
+        os.makedirs(self._ssd_cache_dir, exist_ok=True)
+
         # ── clock ──
         self._clock = time.monotonic
 
@@ -100,6 +116,10 @@ class KVBlockAllocator:
         self._total_cow_clones: int = 0
         self._total_swaps_out: int = 0
         self._total_swaps_in: int = 0
+        self._total_ssd_swaps_out: int = 0
+        self._total_ssd_swaps_in: int = 0
+        self._total_ssd_bytes_written: int = 0
+        self._wa_factor: float = 1.0  # Write Amplification tracking
 
     # ------------------------------------------------------------------
     # Public API — real cudaMalloc / cudaFree
@@ -383,6 +403,181 @@ class KVBlockAllocator:
             )
 
     # ------------------------------------------------------------------
+    # REAL SSD swap (HiFC §3.2 — Flash Cache Block Allocator)
+    # GPU tensor → disk file, disk file → GPU tensor
+    # HiFC block append policy: sequential writes to minimize WA (<1.02)
+    # ------------------------------------------------------------------
+
+    def _ssd_path(self, block_id: int) -> str:
+        if block_id in self._ssd_block_to_file:
+            return self._ssd_block_to_file[block_id]
+        path = os.path.join(self._ssd_cache_dir, f"kv_block_{block_id:08d}.pt")
+        self._ssd_block_to_file[block_id] = path
+        return path
+
+    def _alloc_ssd_block(self) -> int:
+        """Sparse SSD block allocation (HiFC block append)."""
+        if self._free_ssd_blocks:
+            return self._free_ssd_blocks.pop()
+        if self._ssd_next_id >= self._ssd_start + self._ssd_capacity:
+            raise OutOfMemoryError(requested=1, available=0, tier=StorageTier.SSD)
+        bid = self._ssd_next_id
+        self._ssd_next_id += 1
+        # Create lazy KVBlock only when first used
+        blk = KVBlock(block_id=bid)
+        blk.storage_tier = StorageTier.SSD
+        self._blocks[bid] = blk
+        return bid
+
+    def swap_out_to_ssd(self, request_id: str, src_block_ids: List[int],
+                        zone: str = "pSLC") -> List[int]:
+        """HiFC-style GPU/CPU → SSD swap-out.
+
+        Writes each block's tensor to a file on NVMe SSD using torch.save.
+        HiFC block append: files written sequentially to minimize WA (< 1.02).
+
+        Parameters
+        ----------
+        request_id : str
+            Owning request identifier.
+        src_block_ids : list[int]
+            GPU or CPU block IDs to evict to SSD.
+        zone : str
+            HiFC zone: "pSLC" (fast ~4.7 GiB/s) or "TLC" (cheap ~1.5 GiB/s).
+
+        Returns list[int] of allocated SSD block IDs.
+        """
+        with self._lock:
+            ssd_ids: List[int] = []
+            ts = self._clock()
+            block_bytes = self._config.block_size_bytes
+
+            for src_bid in src_block_ids:
+                src_blk = self._get_block(src_bid)
+                if src_blk._tensor is None:
+                    continue
+
+                ssd_bid = self._alloc_ssd_block()
+                path = self._ssd_path(ssd_bid)
+
+                # ── HiFC sequential write ──
+                torch.save(src_blk._tensor.cpu(), path)
+
+                actual_bytes = os.path.getsize(path)
+                n = max(self._total_ssd_swaps_out, 1)
+                self._wa_factor = (self._wa_factor * n + actual_bytes / max(block_bytes, 1)) / (n + 1)
+                self._total_ssd_bytes_written += actual_bytes
+
+                # Transfer metadata to SSD block
+                ssd_blk = self._blocks[ssd_bid]
+                ssd_blk.num_tokens = src_blk.num_tokens
+                ssd_blk.group_id = src_blk.group_id
+                ssd_blk.storage_tier = StorageTier.SSD
+                ssd_blk.state = KVBlockState.ALLOCATED
+                ssd_blk.ref_count = 1
+                ssd_blk.touch(ts)
+
+                # Free source block
+                src_blk.decrement_ref()
+                if src_bid < self._cpu_start:
+                    self._add_to_free(src_bid)
+                else:
+                    self._add_to_cpu_free(src_bid)
+
+                self._request_blocks.setdefault(request_id, set()).add(ssd_bid)
+                self._used_ssd_block_ids.add(ssd_bid)
+                ssd_ids.append(ssd_bid)
+
+            self._total_ssd_swaps_out += 1
+            return ssd_ids
+
+    def swap_in_from_ssd(self, request_id: str, ssd_block_ids: List[int],
+                         target_device: str = "cuda:0") -> List[int]:
+        """HiFC-style SSD → GPU/CPU swap-in.
+
+        Reads block tensors from disk and loads to target device.
+        """
+        with self._lock:
+            needed = len(ssd_block_ids)
+            if target_device != "cpu":
+                if len(self._free_blocks) < needed:
+                    raise OutOfMemoryError(requested=needed, available=len(self._free_blocks))
+
+            restored_ids: List[int] = []
+            ts = self._clock()
+
+            for ssd_bid in ssd_block_ids:
+                path = self._ssd_path(ssd_bid)
+                if not os.path.exists(path):
+                    continue
+
+                tensor = torch.load(path, map_location="cpu", weights_only=True)
+                if target_device != "cpu":
+                    tensor = tensor.to(target_device)
+
+                if target_device != "cpu":
+                    gpu_bid = self._free_blocks.pop()
+                    gpu_blk = self._blocks[gpu_bid]
+                    gpu_blk._tensor = tensor
+                    gpu_blk._tensor_shape = self._tensor_shape
+                    gpu_blk.num_tokens = self._get_block(ssd_bid).num_tokens
+                    gpu_blk.group_id = self._get_block(ssd_bid).group_id
+                    gpu_blk.storage_tier = StorageTier.GPU
+                    gpu_blk.state = KVBlockState.ALLOCATED
+                    gpu_blk.ref_count = 1
+                    gpu_blk.touch(ts)
+                    restored_ids.append(gpu_bid)
+                    self._request_blocks.setdefault(request_id, set()).add(gpu_bid)
+                else:
+                    cpu_bid = self._free_cpu_blocks.pop()
+                    cpu_blk = self._blocks[cpu_bid]
+                    cpu_blk._tensor = tensor
+                    cpu_blk._tensor_shape = self._tensor_shape
+                    cpu_blk.num_tokens = self._get_block(ssd_bid).num_tokens
+                    cpu_blk.group_id = self._get_block(ssd_bid).group_id
+                    cpu_blk.storage_tier = StorageTier.CPU
+                    cpu_blk.state = KVBlockState.ALLOCATED
+                    cpu_blk.ref_count = 1
+                    cpu_blk.touch(ts)
+                    restored_ids.append(cpu_bid)
+                    self._request_blocks.setdefault(request_id, set()).add(cpu_bid)
+
+                # Cleanup SSD
+                os.remove(path)
+                self._add_to_ssd_free(ssd_bid)
+
+            self._total_ssd_swaps_in += 1
+            return restored_ids
+
+    # ── SSD pool queries ──
+
+    @property
+    def free_ssd_blocks_count(self) -> int:
+        with self._lock:
+            return len(self._free_ssd_blocks)
+
+    @property
+    def used_ssd_blocks_count(self) -> int:
+        with self._lock:
+            return len(self._used_ssd_block_ids)
+
+    @property
+    def ssd_bytes_on_disk(self) -> int:
+        with self._lock:
+            return self._total_ssd_bytes_written
+
+    @property
+    def write_amplification(self) -> float:
+        return self._wa_factor
+
+    def get_ssd_block_ids(self, request_id: str) -> List[int]:
+        with self._lock:
+            return sorted(
+                bid for bid in self._request_blocks.get(request_id, set())
+                if bid >= self._ssd_start
+            )
+
+    # ------------------------------------------------------------------
     # Pinned blocks
     # ------------------------------------------------------------------
 
@@ -423,6 +618,10 @@ class KVBlockAllocator:
     @property
     def total_cpu_blocks(self) -> int:
         return self._cpu_capacity
+
+    @property
+    def total_ssd_blocks(self) -> int:
+        return self._ssd_capacity
 
     @property
     def free_blocks(self) -> int:
@@ -515,6 +714,15 @@ class KVBlockAllocator:
                 "total_cow_clones": self._total_cow_clones,
                 "total_swaps_out": self._total_swaps_out,
                 "total_swaps_in": self._total_swaps_in,
+                # ── SSD pool (HiFC) ──
+                "total_blocks_ssd": self._ssd_capacity,
+                "free_blocks_ssd": len(self._free_ssd_blocks),
+                "used_blocks_ssd": len(self._used_ssd_block_ids),
+                "total_ssd_swaps_out": self._total_ssd_swaps_out,
+                "total_ssd_swaps_in": self._total_ssd_swaps_in,
+                "ssd_bytes_on_disk": self._total_ssd_bytes_written,
+                "write_amplification": round(self._wa_factor, 3),
+                "ssd_cache_dir": self._ssd_cache_dir,
                 "usage_ratio": round(self.usage_ratio, 4),
                 "block_size": self._block_size,
                 "block_tensor_bytes": self._config.block_size_bytes,
@@ -548,6 +756,17 @@ class KVBlockAllocator:
     def _add_to_cpu_free(self, physical_id: int):
         self._blocks[physical_id].mark_free()
         self._free_cpu_blocks.add(physical_id)
+
+    def _add_to_ssd_free(self, physical_id: int):
+        if physical_id in self._blocks:
+            self._blocks[physical_id].mark_free()
+        self._free_ssd_blocks.add(physical_id)
+        self._used_ssd_block_ids.discard(physical_id)
+        # Clean up the file on disk
+        path = self._ssd_path(physical_id)
+        if os.path.exists(path):
+            os.remove(path)
+        self._ssd_block_to_file.pop(physical_id, None)
 
     def _release_block(self, physical_id: int) -> bool:
         block = self._blocks[physical_id]
