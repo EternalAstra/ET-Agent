@@ -72,13 +72,13 @@ class InferenceEngine:
         self.head_dim = getattr(cfg, "head_dim",
                                 cfg.hidden_size // cfg.num_attention_heads)
 
-        # Memory manager
-        profile = ModelKVProfile(
-            model_family=cfg.model_type, num_layers=self.num_layers,
-            num_kv_heads=self.num_kv_heads, head_dim=self.head_dim)
-        config = MemoryConfig(block_size=block_size,
-                              gpu_capacity_bytes=gpu_memory_gb * 1024**3,
-                              use_cuda=use_cuda, model_profile=profile)
+        # Memory manager — auto-detect from model config
+        config = MemoryConfig.for_model(cfg.model_type, block_size=block_size,
+                                        gpu_gb=gpu_memory_gb, use_cuda=use_cuda)
+        if config.model_profile is None:
+            config.model_profile = ModelKVProfile(
+                model_family=cfg.model_type, num_layers=self.num_layers,
+                num_kv_heads=self.num_kv_heads, head_dim=self.head_dim)
         self.allocator = KVBlockAllocator(config)
 
         # Prefix cache for system prompt COW sharing

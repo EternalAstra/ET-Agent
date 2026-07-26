@@ -60,6 +60,12 @@ class ModelKVProfile:
 
 # Known profiles
 KNOWN_PROFILES: dict[str, ModelKVProfile] = {
+    "llama-3.2-3b": ModelKVProfile(
+        model_family="llama",
+        num_layers=28,
+        num_kv_heads=8,
+        head_dim=128,
+    ),
     "qwen2.5-7b": ModelKVProfile(
         model_family="qwen2",
         num_layers=28,
@@ -166,7 +172,7 @@ class MemoryConfig:
                   gpu_gb: int = 80, use_cuda: bool = True) -> "MemoryConfig":
         profile = None
         for key, prof in KNOWN_PROFILES.items():
-            if key in model_name.lower():
+            if key in model_name.lower() or model_name.lower() in key:
                 profile = prof
                 break
         return MemoryConfig(
