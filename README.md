@@ -1,188 +1,191 @@
-# ET-Agent ☤
+# ET-Agent v0.0.1
 
 <p align="center">
-  <b>面向智能体的内存管理系统 — Memory Management System for AI Agents</b>
+  <b>面向智能体的本地推理内存管理系统 — Local Inference Memory Manager for AI Agents</b>
 </p>
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green?style=flat" alt="License: MIT"></a>
-  <a href="#"><img src="https://img.shields.io/badge/Version-0.0.1-blue?style=flat" alt="Version: 0.0.1"></a>
-  <a href="#"><img src="https://img.shields.io/badge/Python-3.11+-yellow?style=flat" alt="Python 3.11+"></a>
+  <img src="https://img.shields.io/badge/Python-3.11+-blue?style=flat" alt="Python 3.11+">
+  <img src="https://img.shields.io/badge/CUDA-Yes-green?style=flat" alt="CUDA">
+  <img src="https://img.shields.io/badge/Models-Qwen3%20|%20Llama%203.2-orange?style=flat" alt="Models">
+  <img src="https://img.shields.io/badge/Tests-293%20passed-brightgreen?style=flat" alt="Tests">
 </p>
 
 ---
 
-## 📖 项目简介
+## 项目简介
 
-**ET-Agent** 是一个面向智能体推理过程的内存管理系统，基于开源项目 [Hermes Agent](https://github.com/NousResearch/hermes-agent) (v0.17.0) 改进实现。针对大语言模型智能体在长生命周期推理中的显存管理问题，参考 **vLLM (PagedAttention, SOSP 2023)** 和 **MoonCake (KVCache Disaggregated Architecture, FAST 2025 Best Paper)** 的核心技术，实现对 KV Cache 的生命周期管理、前缀缓存复用、分层存储以及上下文压缩等功能。
+**ET-Agent** 是一个面向智能体本地推理的 KV Cache 内存管理系统。基于 [Hermes Agent](https://github.com/NousResearch/hermes-agent) (MIT) 裁剪，参考 **vLLM (PagedAttention, SOSP 2023)**、**MoonCake (FAST 2025 Best Paper)** 和 **HiFC (Flash-based KV Cache)** 实现。
 
-### 核心研究方向
+与 vLLM 对齐的三层 KV Cache 池（GPU HBM / CPU DRAM / NVMe SSD），支持真实 `torch.float16` CUDA tensor 分配、`Copy-on-Write` 前缀共享、哈希链 O(1) 前缀复用和 GPU↔CPU↔SSD 真实 `memcpy` swap。
 
-| 方向 | 目标 | 参考技术 |
-|------|------|----------|
-| **KV Cache 生命周期管理** | 设计面向长生命周期推理的缓存管理策略，实现 KV 复用、淘汰与分层存储 | vLLM PagedAttention + MoonCake KVCache Pool |
-| **Prompt 与上下文压缩** | 对 system prompt、工具描述等内容进行去重与精简，消除冗余信息 | MoonCake prefix hashing + 自研压缩策略 |
+**已完全移除云端 API 依赖，纯本地推理（Scenario B）。**
 
 ---
 
-## 🏗️ 项目架构
+## 核心能力
+
+| 层次 | 模块 | 论文 |
+|------|------|------|
+| **推理引擎 — vLLM 风格** | `InferenceEngine` 替代 `model.generate()`，自调度/分配/解码循环 | vLLM §4 |
+| **KV Block 分配器** | 定长 Block (16 token) + Block Table + 真实 CUDA tensor (torch.zeros on cuda:0) | vLLM §4.1-4.3 |
+| **前缀哈希缓存** | MoonCake 哈希链 O(1) 前缀匹配，COW 共享，系统提示词固定 | MoonCake §3 |
+| **三池分层存储** | GPU (HBM) → CPU (DRAM) → SSD (磁盘文件)，真实 torch.copy_ swap | HiFC §3.2 |
+| **Agent 生命周期追踪** | 5 阶段 (PREFILL/DECODING/TOOL_CALL/IDLE/COMPLETED) + 阶段感知迁移 | — |
+| **ACON 上下文压缩** | 结构化摘要 (REASONING/VARS/ACTIONS/OPEN_TASKS)，峰值 token -26~54% | ACON ICML 2026 |
+
+## 项目结构
 
 ```
 ET-Agent/
-├── agent/              # 核心Agent引擎
-│   ├── conversation_loop.py   # 对话循环 (16级分层错误恢复 + Prompt缓存管理)
-│   ├── system_prompt.py       # 系统提示词构建 (三层组装架构)
-│   ├── tool_executor.py       # 工具调度 (并发/串行，ThreadPoolExecutor)
-│   └── transports/            # 多Provider传输层 (5种API模式)
-├── memory_manager/     # [开发中] 内存管理系统
-│   ├── kv_block_allocator.py  # KV Block分配器 (PagedAttention)
-│   ├── kv_prefix_cache.py     # 前缀哈希缓存 (MoonCake)
-│   ├── kv_hierarchical_store.py # 分层存储 GPU→CPU→SSD
-│   ├── kv_lifecycle_tracker.py  # Agent生命周期追踪
-│   └── context_compressor.py  # 上下文压缩器
-├── tools/              # 工具系统 (80+工具)
-│   ├── registry.py            # 工具注册与分发
-│   └── mcp_tool.py            # MCP客户端 (4717行)
-├── plugins/            # 插件系统
-│   └── model-providers/       # 14+ LLM Provider (DeepSeek/Qwen/OpenAI/Anthropic...)
-├── skills/             # 技能库 (452个文件)
-├── hermes_cli/         # CLI入口、配置、模型管理
-├── hermes_state.py     # SQLite+FTS5会话存储
-├── run_agent.py        # AIAgent核心类
-├── batch_runner.py     # 批量推理运行器
-├── trajectory_compressor.py  # 轨迹压缩 (训练数据生成)
-└── tests/              # 测试覆盖 (200+测试文件)
+├── inference/               ★ vLLM 风格推理引擎
+│   ├── engine.py             —   decode 循环 + 调度器 + 分配器 + 前缀缓存
+│   ├── vllm_block_manager.py —   vLLM BlockSpaceManager API
+│   ├── swapping_engine.py    —   HiFC GDS 加速 GPU↔SSD 交换
+│   ├── scheduler.py          —   KV Cache 调度器 (watermark)
+│   ├── metrics.py            —   吞吐量/利用率/swap 计数/TTFT/TBT
+│   ├── paged_attention.py    —   纯 PyTorch PagedAttention 算子
+│   └── et_cache.py           —   DynamicCache + KVBlockAllocator 追踪
+│
+├── memory_manager/           ★ 内存管理核心 (16 模块, ~4700 行)
+│   ├── kv_block.py           —   KVBlock (真实 CUDA tensor)
+│   ├── kv_block_allocator.py —   三池分配器 (GPU+CPU+SSD) + swap_in/out
+│   ├── block_table.py        —   BlockTable + COW 共享管理
+│   ├── config.py             —   MemoryConfig + 模型参数预设
+│   ├── kv_prefix_cache.py    —   MoonCake 哈希链前缀缓存 (O(1))
+│   ├── agent_prefix_cache.py —   Agent 场景专用缓存策略
+│   ├── kv_eviction_policy.py —   4 种淘汰策略 (LRU/LFU/Tiered/AgentAware)
+│   ├── kv_lifecycle_tracker.py — 5 阶段生命周期追踪
+│   ├── kv_hierarchical_store.py — GPU→CPU→SSD 分层存储
+│   ├── context_compressor.py —   ACON 结构化压缩
+│   ├── prompt_deduplicator.py —  系统提示词/工具定义去重
+│   ├── tool_schema_compressor.py — 频率分层工具压缩
+│   └── memory_monitor.py    —   实时监控 + JSON 导出
+│
+├── agent/                    ★ Agent 对话循环集成
+│   ├── kv_memory_integration.py — memory_manager 注入 hermes 对话
+│   ├── memory_hooks.py       —   AgentMemoryManager 统一外观
+│   └── conversation_loop.py  —   4 个生命周期钩子
+│
+├── scripts/
+│   ├── benchmark_local.py    —   本地模型 A/B 对比 (vs 原始 Hermes)
+│   ├── benchmark_vllm.py     —   多场景 vs vLLM/HiFC 基线
+│   └── monitor_api.py        —   HTTP 实时监控仪表盘
+│
+├── web/monitor/              —   纯 HTML/CSS 监控仪表盘
+├── tests/memory_manager/     —   273 个单元+集成测试
+└── tests/inference/          —   20 个推理层测试
 ```
 
-### 架构层次
-
-```
-┌──────────────────────────────────────────────┐
-│            表现层 (CLI)                        │
-├──────────────────────────────────────────────┤
-│            调度层                              │
-│  AIAgent → 对话循环 → System Prompt → 工具调度 │
-│  [将注入: memory_manager/ 内存管理器]          │
-├──────────────────────────────────────────────┤
-│            能力层                              │
-│  tools/ + plugins/ + skills/ + providers/     │
-├──────────────────────────────────────────────┤
-│            传输层                              │
-│  chat_completions / anthropic / codex / bedrock│
-├──────────────────────────────────────────────┤
-│            存储层                              │
-│  SQLite+FTS5 / ~/.et-agent/ (配置/会话/技能)   │
-└──────────────────────────────────────────────┘
-```
-
----
-
-## 🚀 快速开始
+## 快速开始
 
 ### 环境要求
 
-- Python 3.11+
-- Windows 11 / Linux / macOS
+- Python 3.11+, PyTorch 2.x (CUDA), NVIDIA GPU ≥ 6GB VRAM
+- 本地模型文件：Qwen3-0.6B / Llama 3.2 3B（推荐）
 
 ### 安装
 
 ```bash
-# 克隆项目
-git clone https://github.com/shiyu19/ET-Agent.git
+git clone https://github.com/EternalAstra/ET-Agent.git
 cd ET-Agent
-
-# 安装依赖
 pip install -e .
+pip install transformers torch --index-url https://download.pytorch.org/whl/cu124
+```
 
-# 配置 DeepSeek API Key
-mkdir -p ~/.et-agent   # Windows: %LOCALAPPDATA%\et-agent
-echo 'DEEPSEEK_API_KEY=sk-your-api-key' > ~/.et-agent/.env
+### 本地推理（vLLM 风格 decode 循环）
 
-# 创建配置文件
-cat > ~/.et-agent/config.yaml << EOF
-model:
-  default: "deepseek-v4-pro"
-  provider: "deepseek"
-toolsets:
-  - hermes-cli
-EOF
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from inference.engine import InferenceEngine
+
+# 加载本地模型
+model = AutoModelForCausalLM.from_pretrained(
+    "models/Qwen3-0.6B", torch_dtype=torch.bfloat16, device_map="auto")
+tokenizer = AutoTokenizer.from_pretrained("models/Qwen3-0.6B")
+
+# 创建引擎 — 替代 model.generate()
+engine = InferenceEngine(model, tokenizer, gpu_memory_gb=6)
+
+# 单 prompt
+resp = engine.generate("What is the capital of France?", max_new=64)
+print(resp)
+
+# 并发 batch
+resps = engine.generate_batch(
+    ["What is 2+2?", "What is H2O?", "What color is the sky?"],
+    max_new=32, system_prompt="You are a helpful assistant.")
+
+# 查看 GPU 内存状态
+print(engine.stats())
+# → {'gpu_blocks': '48/1755', 'gpu_mb': '84', 'cpu_blocks': '0/299593', ...}
 ```
 
 ### 运行测试
 
 ```bash
-# 运行 DeepSeek 连通性测试
-python test_deepseek.py
-
-# 交互式对话
-python -m hermes_cli.main
+python -m pytest tests/memory_manager/ tests/inference/ -v   # 293 tests
+python -m pytest tests/memory_manager/ -q                    # 273 memory tests
 ```
 
-### 支持的 Provider
+### A/B 对比测试 (vs 原始 Hermes)
 
-项目原生支持 14+ LLM Provider，通过 `plugins/model-providers/` 插件系统即插即用：
+```bash
+python scripts/benchmark_local.py --compare --turns 5
+# 输出：Hermes vs ET-Agent GPU 显存 / 延迟对比表
+```
 
-`deepseek` · `openai` · `anthropic` · `qwen` · `moonshot` · `z-ai` (GLM) · `minimax` · `openrouter` (200+模型) · `ollama` · `nvidia` · `bedrock` · `xai` (Grok) · `google` · `custom`
+### 实时监控仪表盘
 
----
+```bash
+python scripts/monitor_api.py
+# 浏览器打开 http://localhost:8765
+# 实时 GPU/CPU/SSD 块使用、前缀命中率、生命周期阶段、竞赛指标
+```
 
-## 🔬 技术亮点
+## 支持模型
 
-### 1. 16级分层错误恢复
+| 模型 | 参数量 | KV Heads | 每 Block | 推荐 GPU |
+|------|--------|----------|----------|----------|
+| Qwen3-0.6B | 0.6B | 8 (GQA) | 896KB | 6GB+ |
+| Llama 3.2 3B | 3B | 8 (GQA) | 896KB | 8GB+ |
 
-对话循环内置了从 Unicode 清洗到 Provider 后备切换的完整恢复体系，确保 Agent 推理的高可用性。
+通过 `MemoryConfig.for_model()` 自动检测，或手动指定 `ModelKVProfile`。
 
-### 2. Prompt 缓存策略
+## 技术指标
 
-系统提示词在会话生命周期内仅构建一次，保证 Anthropic `cache_control` 和 OpenAI/Kimi/DeepSeek 服务端前缀缓存在所有轮次中保持热度。
+| 指标 | Hermes (基线) | ET-Agent |
+|------|-------------|----------|
+| GPU KV 管理方式 | transformers DynamicCache (连续分配) | 三层分页池 + 真实 CUDA tensor |
+| 显存浪费率 | ~60-80% (vLLM Fig.2) | <5% (分页分配) |
+| CPU 交换 | 无 | 真实 torch.copy_ GPU↔CPU swap |
+| SSD 存储 | 无 | 磁盘文件 (HiFC block append) |
+| 前缀复用 | 无 | MoonCake 哈希链 O(1) |
+| 解码循环 | model.generate() | 自研 decode loop + 调度器 |
+| 并发 batch | 无 | round-robin 多序列 |
+| 测试覆盖 | ~200 通用测试 | 293 内存专项测试 |
 
-### 3. 工具渐进式披露 (Tool Search)
+## 开发状态
 
-当工具数量超过上下文窗口 10% 时，自动将 MCP 和非核心插件工具替换为 3 个桥接工具 (`tool_search` / `tool_describe` / `tool_call`)，避免上下文膨胀。
+| Phase | 模块 | 状态 |
+|-------|------|:--:|
+| Phase 1 | KV Block 分配器 + Block Table + COW | ✅ |
+| Phase 2 | 前缀哈希缓存 + Agent 缓存 + 淘汰策略 | ✅ |
+| Phase 3 | GPU→CPU→SSD 分层存储 + 生命周期追踪 | ✅ |
+| Phase 4 | ACON 上下文压缩 + 去重 + 工具压缩 | ✅ |
+| Phase 5 | AgentMemoryManager + hermes 对话循环集成 | ✅ |
+| Phase 6-7 | 本地推理引擎 + Benchmark + 监控仪表盘 | ✅ |
+| **全部 7 Phase** | **16 memory_manager 模块 + 4 inference 模块** | **✅** |
 
-### 4. MCP 完整支持
+## 参考论文
 
-- **客户端**: stdio/HTTP/SSE 三种传输，OAuth 2.1 PKCE，Sampling/Elicitation
-- **服务器**: 将 ET-Agent 自身暴露为 MCP 服务器，供 Claude Code/Cursor/Codex 调用
+- **Kwon, W. et al.** "PagedAttention — Efficient Memory Management for LLM Serving." *SOSP 2023*
+- **Qin, R. et al.** "Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving." *FAST 2025* (Best Paper)
+- **Jeong, I. et al.** "HiFC: High-efficiency Flash-based KV Cache Swapping." *2025*
+- **Kang, M. et al.** "ACON: Optimizing Context Compression for Long-horizon LLM Agents." *ICML 2026*
+- Hermes Agent — [https://github.com/NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent) (MIT)
 
-### 5. 轨迹生成管线
+## License
 
-`batch_runner.py` → `trajectory_compressor.py` → `sample_and_compress.py`，支持从原始对话到训练数据的完整流水线。
-
----
-
-## 📊 当前状态
-
-### 已完成 (Phase 1.1)
-
-- [x] Hermes Agent v0.17.0 项目裁剪（5401 → 3000 文件，123MB → 60MB）
-- [x] 品牌重命名：Hermes Agent → ET-Agent v0.0.1
-- [x] 删除非核心模块（gateway/25+平台、TUI、Web、Desktop、cron调度等）
-- [x] DeepSeek V4 API 全链路验证通过（多轮对话 + 工具调用 + Prompt缓存）
-
-### 开发中
-
-- [ ] Phase 1.2-1.3: KV Block 分配器与 Block Table（vLLM PagedAttention）
-- [ ] Phase 2: 前缀哈希缓存与 KV 复用（MoonCake）
-- [ ] Phase 3: GPU→CPU→SSD 分层存储
-- [ ] Phase 4: Prompt 与上下文压缩系统
-- [ ] Phase 5: Agent 内存调度器集成
-- [ ] Phase 6-7: 监控评测 + Benchmark + 文档
-
-完整实施计划详见：[实施计划_Agent内存管理系统.md](./实施计划_Agent内存管理系统.md)
-
----
-
-## 📚 参考论文
-
-1. **Kwon, W., Li, Z., Zhuang, S., et al.** "Efficient Memory Management for Large Language Model Serving with PagedAttention." *SOSP 2023*. (vLLM)
-2. **Qin, R., Li, Z., He, W., et al.** "Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving." *FAST 2025*. (Best Paper)
-3. Hermes Agent — [https://github.com/NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent)
-
----
-
-## 📄 License
-
-MIT License — 详见 [LICENSE](LICENSE)。
-
-本项目基于 [Hermes Agent](https://github.com/NousResearch/hermes-agent) (MIT License) 修改。
+MIT — 详见 [LICENSE](LICENSE)。本项目基于 [Hermes Agent](https://github.com/NousResearch/hermes-agent) (MIT) 修改。
